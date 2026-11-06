@@ -1,7 +1,8 @@
 use crate::loom::cell::UnsafeCell;
 use crate::loom::future::AtomicWaker;
-use crate::loom::sync::atomic::AtomicUsize;
 use crate::loom::sync::Arc;
+use crate::loom::sync::atomic::AtomicUsize;
+use crate::loom::thread;
 use crate::runtime::park::CachedParkThread;
 use crate::sync::mpsc::error::TryRecvError;
 use crate::sync::mpsc::{bounded, list, unbounded};
@@ -13,7 +14,12 @@ use std::panic;
 use std::process;
 use std::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed, Release};
 use std::task::Poll::{Pending, Ready};
-use std::task::{ready, Context, Poll};
+use std::task::{Context, Poll, ready};
+
+// The low bit marks receiver destruction. Remaining bits count send operations
+// currently in-flight inside Chan::send.
+const RX_DROPPED: usize = 1;
+const ACTIVE_SEND: usize = 2;
 
 /// Channel sender.
 pub(crate) struct Tx<T, S> {
@@ -70,6 +76,10 @@ pub(super) struct Chan<T, S> {
     /// Tracks the number of outstanding weak sender handles.
     tx_weak_count: AtomicUsize,
 
+    /// Post-drop cleanup coordination: bit 0 marks receiver destruction,
+    /// remaining bits count active send operations currently publishing.
+    send_state: AtomicUsize,
+
     /// Only accessed by `Rx` handle.
     rx_fields: UnsafeCell<RxFields<T>>,
 }
@@ -84,6 +94,7 @@ where
             .field("semaphore", &self.semaphore)
             .field("rx_waker", &*self.rx_waker)
             .field("tx_count", &self.tx_count)
+            .field("send_state", &self.send_state)
             .field("rx_fields", &"...")
             .finish()
     }
@@ -138,6 +149,7 @@ fn channel_from_list<T, S: Semaphore>(
         rx_waker: CachePadded::new(AtomicWaker::new()),
         tx_count: AtomicUsize::new(1),
         tx_weak_count: AtomicUsize::new(0),
+        send_state: AtomicUsize::new(0),
         rx_fields: UnsafeCell::new(RxFields {
             list: rx,
             rx_closed: false,
@@ -192,11 +204,6 @@ impl<T, S> Tx<T, S> {
         &self.inner.semaphore
     }
 
-    /// Send a message and notify the receiver.
-    pub(crate) fn send(&self, value: T) {
-        self.inner.send(value);
-    }
-
     /// Wake the receive half
     pub(crate) fn wake_rx(&self) {
         self.inner.rx_waker.wake();
@@ -209,6 +216,11 @@ impl<T, S> Tx<T, S> {
 }
 
 impl<T, S: Semaphore> Tx<T, S> {
+    /// Send a message and notify the receiver.
+    pub(crate) fn send(&self, value: T) {
+        self.inner.send(value);
+    }
+
     pub(crate) fn is_closed(&self) -> bool {
         self.inner.semaphore.is_closed()
     }
@@ -506,6 +518,18 @@ impl<T, S: Semaphore> Drop for Rx<T, S> {
 
         self.close();
 
+        // Mark receiver as dropped and check for active senders.
+        let prior = self.inner.send_state.fetch_or(RX_DROPPED, AcqRel);
+
+        // If there were active senders in flight, wait for them to finish publishing.
+        // In-flight senders only perform a few non-blocking memory writes and
+        // decrement the active count, so this loop is bounded and nanosecond-scale.
+        if prior >> 1 != 0 {
+            while self.inner.send_state.load(Acquire) >> 1 != 0 {
+                thread::yield_now();
+            }
+        }
+
         self.inner.rx_fields.with_mut(|rx_fields_ptr| {
             let rx_fields = unsafe { &mut *rx_fields_ptr };
             struct Guard<'a, T, S: Semaphore> {
@@ -547,15 +571,57 @@ impl<T, S: Semaphore> Drop for Rx<T, S> {
 
 // ===== impl Chan =====
 
-impl<T, S> Chan<T, S> {
+impl<T, S: Semaphore> Chan<T, S> {
     fn send(&self, value: T) {
-        // Push the value
+        // Fast path: if the receiver has already been destroyed, do not attempt to publish.
+        // A single relaxed load avoids atomic RMW cycles and cache line invalidation
+        // when publishing to an already-closed channel.
+        if self.send_state.load(Relaxed) & RX_DROPPED != 0 {
+            self.semaphore.add_permit();
+            drop(value);
+            return;
+        }
+
+        // Track active send operations. The low bit marks receiver destruction,
+        // while the remaining bits count active senders.
+        let prior = self.send_state.fetch_add(ACTIVE_SEND, AcqRel);
+
+        // If the receiver was destroyed concurrently between the pre-check and fetch_add,
+        // undo the registration, restore the permit, and drop the message immediately.
+        // We release the active send count BEFORE invoking user-defined drop(value)
+        // or returning permits, ensuring no user code executes while holding the counter.
+        if prior & RX_DROPPED != 0 {
+            self.send_state.fetch_sub(ACTIVE_SEND, Release);
+            self.semaphore.add_permit();
+            drop(value);
+            return;
+        }
+
+        struct SendGuard<'a, T, S: Semaphore>(&'a Chan<T, S>);
+        impl<T, S: Semaphore> Drop for SendGuard<'_, T, S> {
+            fn drop(&mut self) {
+                self.0.send_state.fetch_sub(ACTIVE_SEND, Release);
+            }
+        }
+
+        let guard = SendGuard(self);
+
+        // Push the value into the queue block
         self.tx.push(value);
+
+        // Release the active-send guard immediately after publishing to the queue,
+        // BEFORE waking the receiver. rx_waker.wake() can invoke arbitrary user-defined
+        // Waker::wake code (which might synchronously drop the receiver).
+        // At this point, the value is fully published in the queue and will be observed
+        // by Rx::drop if a concurrent receiver drop occurs.
+        drop(guard);
 
         // Notify the rx task
         self.rx_waker.wake();
     }
+}
 
+impl<T, S> Chan<T, S> {
     pub(super) fn decrement_weak_count(&self) {
         self.tx_weak_count.fetch_sub(1, Relaxed);
     }

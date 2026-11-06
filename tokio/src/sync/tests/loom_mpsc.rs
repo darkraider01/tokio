@@ -136,7 +136,7 @@ fn dropping_unbounded_tx() {
 #[test]
 fn try_recv() {
     loom::model(|| {
-        use crate::sync::{mpsc, Semaphore};
+        use crate::sync::{Semaphore, mpsc};
         use loom::sync::{Arc, Mutex};
 
         const PERMITS: usize = 2;
@@ -274,4 +274,109 @@ fn len_during_close_block_cap() {
 #[test]
 fn len_during_close_block_cap_plus_1() {
     len_during_close_helper(BLOCK_CAP + 1);
+}
+
+#[test]
+fn loom_permit_send_and_rx_drop() {
+    loom::model(|| {
+        use loom::sync::atomic::AtomicUsize;
+        use std::sync::atomic::Ordering::SeqCst;
+
+        struct Msg(Arc<AtomicUsize>);
+        impl Drop for Msg {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, SeqCst);
+            }
+        }
+
+        let (tx, rx) = mpsc::channel(1);
+        let permit = block_on(tx.clone().reserve_owned()).unwrap();
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let flag = dropped.clone();
+
+        let th1 = thread::spawn(move || {
+            permit.send(Msg(flag));
+        });
+
+        let th2 = thread::spawn(move || {
+            drop(rx);
+        });
+
+        th1.join().unwrap();
+        th2.join().unwrap();
+
+        assert_eq!(dropped.load(SeqCst), 1);
+        drop(tx);
+    });
+}
+
+#[test]
+fn loom_racing_send_and_rx_drop() {
+    loom::model(|| {
+        use loom::sync::atomic::AtomicUsize;
+        use std::sync::atomic::Ordering::SeqCst;
+
+        struct Msg(Arc<AtomicUsize>);
+        impl Drop for Msg {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, SeqCst);
+            }
+        }
+
+        let (tx, rx) = mpsc::channel(1);
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let flag = dropped.clone();
+
+        let th1 = thread::spawn(move || {
+            let _ = block_on(tx.send(Msg(flag)));
+        });
+
+        let th2 = thread::spawn(move || {
+            drop(rx);
+        });
+
+        th1.join().unwrap();
+        th2.join().unwrap();
+
+        assert_eq!(dropped.load(SeqCst), 1);
+    });
+}
+
+#[test]
+fn loom_two_senders_racing_rx_drop() {
+    loom::model(|| {
+        use loom::sync::atomic::AtomicUsize;
+        use std::sync::atomic::Ordering::SeqCst;
+
+        struct Msg(Arc<AtomicUsize>);
+        impl Drop for Msg {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, SeqCst);
+            }
+        }
+
+        let (tx1, rx) = mpsc::channel(2);
+        let tx2 = tx1.clone();
+        let dropped = Arc::new(AtomicUsize::new(0));
+
+        let flag1 = dropped.clone();
+        let th1 = thread::spawn(move || {
+            let _ = tx1.try_send(Msg(flag1));
+        });
+
+        let flag2 = dropped.clone();
+        let th2 = thread::spawn(move || {
+            let _ = tx2.try_send(Msg(flag2));
+        });
+
+        let th3 = thread::spawn(move || {
+            drop(rx);
+        });
+
+        th1.join().unwrap();
+        th2.join().unwrap();
+        th3.join().unwrap();
+
+        assert_eq!(dropped.load(SeqCst), 2);
+    });
 }
