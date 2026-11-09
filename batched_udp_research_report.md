@@ -4,9 +4,9 @@
 **Target Subsystem:** `tokio::net::UdpSocket` / Linux Network Stack  
 **Branch:** `experiment/udp-batching`  
 **Base Commit:** `eb9cdf2ff012ec22d4efd74cf46d04222264cd8e` (`git merge-base HEAD upstream/master`)  
-**Current HEAD:** `abeab870` (`git rev-parse --short HEAD`)  
-**Total Commits Ahead of Base:** 41 commits (`git rev-list --count eb9cdf2f..HEAD`)  
-**Commit Series Breakdown:** 6 prototype commits + 12 remediation series 1 + 15 remediation series 2 + 8 remediation series 3  
+**Current HEAD:** `docs: finalize remediation ledger and research report`  
+**Total Commits Ahead of Base:** 47 commits (`git rev-list --count eb9cdf2f..HEAD`)  
+**Commit Series Breakdown:** 6 prototype commits + 12 remediation series 1 + 15 remediation series 2 + 14 remediation series 3  
 **Kernel & Architecture:** Linux 6.19.10 x86_64 (12 Cores, Local Loopback)  
 
 ---
@@ -228,7 +228,7 @@ All commits on branch `experiment/udp-batching` ahead of `eb9cdf2ff012ec22d4efd7
 | 32 | `2fe9c9df` | `fix(bench)` | Check process resource usage errors (`getrusage`) |
 | 33 | `9a7d1733` | `docs(bench)` | Use accurate throughput units (`MiB/s`) |
 
-### Part 4: Final Hardening Series 3 (8 Commits)
+### Part 4: Final Hardening Series 3 (14 Commits)
 | # | Commit | Type & Scope | Summary |
 |---|---|---|---|
 | 34 | `eb6c87d2` | `fix(bench)` | Align packet counts with measurement intervals (two-phase shutdown and boundary alignment) |
@@ -239,6 +239,12 @@ All commits on branch `experiment/udp-batching` ahead of `eb9cdf2ff012ec22d4efd7
 | 39 | `76ed2124` | `test(net)` | Synchronize receiver cancellation deterministically |
 | 40 | `5314bf5f` | `docs(net)` | Clarify batch fairness and cooperative scheduling |
 | 41 | `abeab870` | `docs` | Correct UDP batching performance claims and units |
+| 42 | `5ff497e7` | `docs` | Reconcile UDP experiment commit history |
+| 43 | `264d14f6` | `docs` | Update upstream MSRV compatibility analysis |
+| 44 | `9a98dc86` | `docs` | Correct upstream precedent references |
+| 45 | `b4dfb454` | `docs` | Update benchmark observations with hardened harness |
+| 46 | `92c9f7dc` | `fix(bench)` | Resolve clippy warnings in benchmark harness |
+| 47 | (Pending) | `docs` | Finalize remediation ledger and research report |
 
 ---
 
