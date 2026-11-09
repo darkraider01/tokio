@@ -724,3 +724,58 @@ async fn test_partial_send_progress() -> io::Result<()> {
     .await
     .expect("test timed out")
 }
+
+#[tokio::test]
+async fn test_poll_readiness_transitions() -> io::Result<()> {
+    time::timeout(TEST_TIMEOUT, async {
+        let sender = Arc::new(UdpSocket::bind("127.0.0.1:0").await?);
+        let receiver = Arc::new(UdpSocket::bind("127.0.0.1:0").await?);
+        let recv_addr = receiver.local_addr()?;
+        let send_addr = sender.local_addr()?;
+
+        let mut b1 = [0u8; 64];
+        let mut b2 = [0u8; 64];
+
+        let poll_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let poll_count_clone = poll_count.clone();
+        let receiver_clone = receiver.clone();
+
+        // Spawn a background sender task that fires after a brief delay
+        let sender_clone = sender.clone();
+        tokio::spawn(async move {
+            // Wait for receiver to poll at least once and register its waker while Pending
+            while poll_count_clone.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+            time::sleep(Duration::from_millis(10)).await;
+            sender_clone
+                .send_many(&[
+                    Datagram::to_addr(b"delayed packet 1", recv_addr),
+                    Datagram::to_addr(b"delayed packet 2", recv_addr),
+                ])
+                .await
+                .unwrap();
+        });
+
+        let mut inbound = [InboundDatagram::new(&mut b1), InboundDatagram::new(&mut b2)];
+        let received = poll_fn(|cx| {
+            poll_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            receiver_clone.poll_recv_many(cx, &mut inbound)
+        })
+        .await?;
+
+        assert_eq!(received, 2);
+        assert!(
+            poll_count.load(std::sync::atomic::Ordering::SeqCst) >= 2,
+            "poll_recv_many should have returned Pending on first poll and Ready after wake-up"
+        );
+        assert_eq!(inbound[0].payload(), b"delayed packet 1");
+        assert_eq!(inbound[0].source, Some(send_addr));
+        assert_eq!(inbound[1].payload(), b"delayed packet 2");
+        assert_eq!(inbound[1].source, Some(send_addr));
+
+        Ok::<(), io::Error>(())
+    })
+    .await
+    .expect("test timed out")
+}
