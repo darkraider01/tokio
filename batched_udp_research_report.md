@@ -262,12 +262,14 @@ The Rust networking ecosystem already features an established high-performance U
 
 ## 6. MSRV Compatibility Analysis
 
-Tokio declares a strict Minimum Supported Rust Version in `tokio/Cargo.toml`:
-```toml
-rust-version = "1.71"
-```
+### The Dual-MSRV Context: Branch Base (1.71) vs Upstream Master (1.85)
 
-### The MSRV Hazard in `UdpSocketBatchExt`
+Tokio's Minimum Supported Rust Version (MSRV) depends on the target baseline:
+- **Experimental Branch Base (`eb9cdf2f`)**: Declares `rust-version = "1.71"`.
+- **Current Upstream `master`**: Raised MSRV to **1.85** in PR #8514 (commit `950af5e0031b`, September 2026).
+
+### Return Position `impl Trait` in Traits (RPITIT)
+
 The experimental extension trait defines:
 ```rust
 pub trait UdpSocketBatchExt {
@@ -282,17 +284,21 @@ pub trait UdpSocketBatchExt {
     ) -> impl std::future::Future<Output = io::Result<usize>> + Send;
 }
 ```
-- Return Position `impl Trait` in Traits (RPITIT) and `async fn` in traits were stabilized in **Rust 1.75.0** (RFC 3185 / RFC 3425).
-- On Rust 1.71.0, compiling `UdpSocketBatchExt` fails with `error[E0562]: impl Trait only allowed in function and inherent method return types, not in trait method return types`.
-- If merged into Tokio core, this trait would violate Tokio's declared 1.71.0 MSRV.
 
-### Resolution Options
-1. **Inherent Methods on `UdpSocket`**:
-   Inherent `async fn` methods on structs (`impl UdpSocket { pub async fn send_many(...) }`) have been supported since Rust 1.39 (November 2019) and are fully compatible with Rust 1.71.0. Furthermore, Tokio's existing socket methods (`send_to`, `recv_from`) are inherent methods, not trait methods.
-2. **Dedicated Future Types**:
-   Define explicit named future structs (e.g. `SendMany<'a>`, `RecvMany<'a>`) implementing `Future`, matching Tokio's historical pre-1.75 design.
-3. **Keep Outside Tokio Core**:
-   Housing the extension trait in a standalone crate or in `tokio-util` (if `tokio-util` adopts a higher MSRV) shields Tokio core's MSRV guarantee.
+- **Stabilization**: Return-Position `impl Trait` in Traits (RPITIT) and `async fn` in traits were stabilized in **Rust 1.75.0** (RFC 3185 / RFC 3425).
+- **Branch Base Evaluation (Rust 1.71)**: Compiling `UdpSocketBatchExt` on Rust 1.71 fails with `error[E0562]: impl Trait only allowed in function and inherent method return types, not in trait method return types`.
+- **Upstream Tokio Evaluation (Rust 1.85+)**: Because upstream Tokio now requires Rust 1.85+, RPITIT is natively supported by the compiler and **no longer violates upstream MSRV**.
+
+### Architectural Implications Beyond MSRV
+
+Even though MSRV is no longer a blocker on modern upstream Tokio, architectural and design considerations strongly favor inherent methods or an external crate over core trait methods:
+
+1. **Ergonomic Consistency**:
+   All core `tokio::net::UdpSocket` methods (`send_to`, `recv_from`, `writable`, `readable`) are inherent methods. Requiring callers to import `tokio::net::UdpSocketBatchExt` introduces unnecessary friction and diverges from existing Tokio networking APIs.
+2. **Dynamic Dispatch & Type Namability**:
+   Traits utilizing RPITIT are not object-safe (cannot be used as `dyn UdpSocketBatchExt`) and return unnameable compiler-generated future types, preventing callers from naming return types in struct fields without boxing.
+3. **Decoupled Evolution**:
+   Housing batched socket extensions in `tokio-util` or a dedicated crate allows the API to evolve (e.g., adding GSO/GRO, ECN control messages, or zero-copy buffers) without being bound by Tokio core's strict 1.x stability guarantees.
 
 ---
 
