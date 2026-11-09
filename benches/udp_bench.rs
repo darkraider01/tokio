@@ -5,7 +5,7 @@
 use std::arch::x86_64::_rdtsc;
 use std::io;
 use std::os::unix::io::AsRawFd;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::udp_batch::{Datagram, InboundDatagram, UdpSocketBatchExt};
@@ -45,12 +45,6 @@ pub struct BenchResult {
     pub peak_rss_kb: i64,
     pub vol_cs: i64,
     pub invol_cs: i64,
-}
-
-#[derive(Default)]
-struct TaskCounters {
-    packets: AtomicU64,
-    syscalls: AtomicU64,
 }
 
 fn get_rusage() -> libc::rusage {
@@ -111,14 +105,7 @@ pub async fn run_throughput_bench(
     }
 
     let running = Arc::new(AtomicBool::new(true));
-
-    // Per-task counters prevent cross-task cache contention and guarantee no dropped metrics on abort.
-    let mut sender_counters = Vec::with_capacity(concurrency);
-    let mut receiver_counters = Vec::with_capacity(concurrency);
-    for _ in 0..concurrency {
-        sender_counters.push(Arc::new(TaskCounters::default()));
-        receiver_counters.push(Arc::new(TaskCounters::default()));
-    }
+    let (shutdown_tx, _) = tokio::sync::watch::channel(false);
 
     // Warm-up phase (100ms): prime memory, kernel tables, and CPU caches.
     let warmup_running = Arc::new(AtomicBool::new(true));
@@ -158,48 +145,60 @@ pub async fn run_throughput_bench(
     let tsc_start = unsafe { _rdtsc() };
     let start_time = Instant::now();
 
-    // Spawn receiver tasks
+    // Spawn receiver tasks with plain local integer counters
     let mut recv_handles = Vec::with_capacity(concurrency);
     for i in 0..concurrency {
         let r = receivers[i].clone();
-        let run = running.clone();
-        let counters = receiver_counters[i].clone();
+        let mut shutdown_rx = shutdown_tx.subscribe();
 
         recv_handles.push(tokio::spawn(async move {
+            let mut local_packets = 0u64;
+            let mut local_syscalls = 0u64;
+
             match mode {
                 Mode::Baseline => {
                     let mut buf = vec![0u8; packet_size + 64];
-                    while run.load(Ordering::Relaxed) {
-                        match r.recv_from(&mut buf).await {
-                            Ok(_) => {
-                                counters.packets.fetch_add(1, Ordering::Relaxed);
-                                counters.syscalls.fetch_add(1, Ordering::Relaxed);
+                    loop {
+                        tokio::select! {
+                            biased;
+                            _ = shutdown_rx.changed() => break,
+                            res = r.recv_from(&mut buf) => match res {
+                                Ok(_) => {
+                                    local_packets += 1;
+                                    local_syscalls += 1;
+                                }
+                                Err(_) => break,
                             }
-                            Err(_) => break,
                         }
                     }
                 }
                 Mode::Grouped(batch_size) => {
                     let mut buf = vec![0u8; packet_size + 64];
-                    while run.load(Ordering::Relaxed) {
-                        if r.readable().await.is_err() {
-                            break;
-                        }
-                        let mut count = 0;
-                        while count < batch_size && run.load(Ordering::Relaxed) {
-                            match r.try_recv_from(&mut buf) {
-                                Ok(_) => {
-                                    count += 1;
-                                    counters.packets.fetch_add(1, Ordering::Relaxed);
-                                    counters.syscalls.fetch_add(1, Ordering::Relaxed);
+                    'outer: loop {
+                        tokio::select! {
+                            biased;
+                            _ = shutdown_rx.changed() => break 'outer,
+                            res = r.readable() => {
+                                if res.is_err() {
+                                    break 'outer;
                                 }
-                                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                                    break;
+                                let mut count = 0;
+                                while count < batch_size {
+                                    match r.try_recv_from(&mut buf) {
+                                        Ok(_) => {
+                                            count += 1;
+                                            local_packets += 1;
+                                            local_syscalls += 1;
+                                        }
+                                        Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                                            break;
+                                        }
+                                        Err(_) => break 'outer,
+                                    }
                                 }
-                                Err(_) => break,
+                                tokio::task::yield_now().await;
                             }
                         }
-                        tokio::task::yield_now().await;
                     }
                 }
                 Mode::Batched(batch_size) => {
@@ -208,38 +207,45 @@ pub async fn run_throughput_bench(
                         .iter_mut()
                         .map(|b| InboundDatagram::new(b.as_mut_slice()))
                         .collect();
-                    while run.load(Ordering::Relaxed) {
-                        match r.recv_many(&mut inbound).await {
-                            Ok(n) => {
-                                counters.packets.fetch_add(n as u64, Ordering::Relaxed);
-                                counters.syscalls.fetch_add(1, Ordering::Relaxed);
+                    loop {
+                        tokio::select! {
+                            biased;
+                            _ = shutdown_rx.changed() => break,
+                            res = r.recv_many(&mut inbound) => match res {
+                                Ok(n) => {
+                                    local_packets += n as u64;
+                                    local_syscalls += 1;
+                                    tokio::task::yield_now().await;
+                                }
+                                Err(_) => break,
                             }
-                            Err(_) => break,
                         }
-                        tokio::task::yield_now().await;
                     }
                 }
             }
+            (local_packets, local_syscalls)
         }));
     }
 
-    // Spawn sender tasks
+    // Spawn sender tasks with plain local integer counters
     let mut send_handles = Vec::with_capacity(concurrency);
     for i in 0..concurrency {
         let s = senders[i].clone();
         let target = receiver_addrs[i];
         let run = running.clone();
-        let counters = sender_counters[i].clone();
 
         send_handles.push(tokio::spawn(async move {
+            let mut local_packets = 0u64;
+            let mut local_syscalls = 0u64;
+
             match mode {
                 Mode::Baseline => {
                     let payload = vec![0x42u8; packet_size];
                     while run.load(Ordering::Relaxed) {
                         match s.send_to(&payload, target).await {
                             Ok(_) => {
-                                counters.packets.fetch_add(1, Ordering::Relaxed);
-                                counters.syscalls.fetch_add(1, Ordering::Relaxed);
+                                local_packets += 1;
+                                local_syscalls += 1;
                             }
                             Err(_) => break,
                         }
@@ -256,8 +262,8 @@ pub async fn run_throughput_bench(
                             match s.try_send_to(&payload, target) {
                                 Ok(_) => {
                                     sent += 1;
-                                    counters.packets.fetch_add(1, Ordering::Relaxed);
-                                    counters.syscalls.fetch_add(1, Ordering::Relaxed);
+                                    local_packets += 1;
+                                    local_syscalls += 1;
                                 }
                                 Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
                                     break;
@@ -276,8 +282,8 @@ pub async fn run_throughput_bench(
                     while run.load(Ordering::Relaxed) {
                         match s.send_many(&batch).await {
                             Ok(n) => {
-                                counters.packets.fetch_add(n as u64, Ordering::Relaxed);
-                                counters.syscalls.fetch_add(1, Ordering::Relaxed);
+                                local_packets += n as u64;
+                                local_syscalls += 1;
                             }
                             Err(_) => break,
                         }
@@ -285,6 +291,7 @@ pub async fn run_throughput_bench(
                     }
                 }
             }
+            (local_packets, local_syscalls)
         }));
     }
 
@@ -329,21 +336,27 @@ pub async fn run_throughput_bench(
     tokio::time::sleep(duration).await;
     running.store(false, Ordering::Relaxed);
 
+    let mut sent = 0u64;
+    let mut send_syscalls = 0u64;
     for h in send_handles {
-        let _ = h.await;
+        if let Ok((pkts, sys)) = h.await {
+            sent += pkts;
+            send_syscalls += sys;
+        }
     }
 
-    // Snapshot timed packets received immediately when senders complete
-    let timed_recv: u64 = receiver_counters
-        .iter()
-        .map(|c| c.packets.load(Ordering::Relaxed))
-        .sum();
+    // Signal cooperative shutdown to all receivers so they exit without aborting
+    let _ = shutdown_tx.send(true);
 
-    // Give receivers a 20ms grace window for in-flight datagrams, then abort
-    tokio::time::sleep(Duration::from_millis(20)).await;
+    let mut timed_recv = 0u64;
+    let mut recv_syscalls = 0u64;
     for h in recv_handles {
-        h.abort();
+        if let Ok((pkts, sys)) = h.await {
+            timed_recv += pkts;
+            recv_syscalls += sys;
+        }
     }
+
     probe_echo_h.abort();
     let mut latency_samples = match tokio::time::timeout(Duration::from_millis(50), probe_h).await {
         Ok(Ok(samples)) => samples,
@@ -363,25 +376,8 @@ pub async fn run_throughput_bench(
     let tsc_end = unsafe { _rdtsc() };
     let rusage_end = get_rusage();
 
-    let sent: u64 = sender_counters
-        .iter()
-        .map(|c| c.packets.load(Ordering::Relaxed))
-        .sum();
-    let recv_after_grace: u64 = receiver_counters
-        .iter()
-        .map(|c| c.packets.load(Ordering::Relaxed))
-        .sum();
-    let total_recv = recv_after_grace + drained_recv;
-
-    let send_syscalls: u64 = sender_counters
-        .iter()
-        .map(|c| c.syscalls.load(Ordering::Relaxed))
-        .sum();
-    let recv_syscalls: u64 = receiver_counters
-        .iter()
-        .map(|c| c.syscalls.load(Ordering::Relaxed))
-        .sum::<u64>()
-        + drained_recv;
+    let total_recv = timed_recv + drained_recv;
+    recv_syscalls += drained_recv;
     let total_syscalls = send_syscalls + recv_syscalls;
 
     let utime_diff = timeval_to_duration(rusage_end.ru_utime)
