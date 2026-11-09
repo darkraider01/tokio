@@ -650,24 +650,30 @@ async fn test_recv_many_heap_fallback() -> io::Result<()> {
 }
 
 #[tokio::test]
-async fn test_partial_send_progress() -> io::Result<()> {
+async fn test_bounded_batch_api_progress() -> io::Result<()> {
     use std::os::fd::AsRawFd;
 
     time::timeout(TEST_TIMEOUT, async {
         let sender = UdpSocket::bind("127.0.0.1:0").await?;
-        let receiver = UdpSocket::bind("127.0.0.1:0").await?;
+        let receiver = Arc::new(UdpSocket::bind("127.0.0.1:0").await?);
         let recv_addr = receiver.local_addr()?;
         let send_addr = sender.local_addr()?;
 
-        // Configure receiver buffer to accommodate batch without kernel drop
+        // Configure receiver buffer to accommodate burst traffic
         unsafe {
             let big_buf: libc::c_int = 4 * 1024 * 1024;
-            libc::setsockopt(
+            let ret = libc::setsockopt(
                 receiver.as_raw_fd(),
                 libc::SOL_SOCKET,
                 libc::SO_RCVBUF,
                 &big_buf as *const _ as *const libc::c_void,
                 std::mem::size_of_val(&big_buf) as libc::socklen_t,
+            );
+            assert_eq!(
+                ret,
+                0,
+                "setsockopt SO_RCVBUF failed: {}",
+                io::Error::last_os_error()
             );
         }
 
@@ -675,10 +681,36 @@ async fn test_partial_send_progress() -> io::Result<()> {
         // A batch of 1050 datagrams must transmit at most MAX_BATCH_SIZE in the first
         // call, requiring the caller to advance their slice and send the remainder.
         let total_packets = 1050;
-        let payload = [0xEEu8; 32];
-        let outbound: Vec<Datagram<'_>> = (0..total_packets)
-            .map(|_| Datagram::to_addr(&payload, recv_addr))
+        let payloads: Vec<Vec<u8>> = (0..total_packets)
+            .map(|seq| format!("pkg-{seq:04}").into_bytes())
             .collect();
+        let outbound: Vec<Datagram<'_>> = payloads
+            .iter()
+            .map(|p| Datagram::to_addr(p, recv_addr))
+            .collect();
+
+        // Spawn a concurrent receiver task to continuously drain packets, preventing
+        // kernel receive queue overflow and ensuring deterministic completion.
+        let rx_task = {
+            let receiver = receiver.clone();
+            tokio::spawn(async move {
+                let mut received_payloads = Vec::with_capacity(total_packets);
+                let mut raw_bufs: Vec<Vec<u8>> = (0..64).map(|_| vec![0u8; 64]).collect();
+                while received_payloads.len() < total_packets {
+                    let mut inbound: Vec<InboundDatagram<'_>> = raw_bufs
+                        .iter_mut()
+                        .map(|b| InboundDatagram::new(b.as_mut_slice()))
+                        .collect();
+                    let n = receiver.recv_many(&mut inbound).await?;
+                    assert!(n > 0);
+                    for d in &inbound[..n] {
+                        assert_eq!(d.source, Some(send_addr));
+                        received_payloads.push(d.payload().to_vec());
+                    }
+                }
+                Ok::<Vec<Vec<u8>>, io::Error>(received_payloads)
+            })
+        };
 
         let mut total_sent = 0;
         let mut send_calls = 0;
@@ -701,23 +733,12 @@ async fn test_partial_send_progress() -> io::Result<()> {
             "Expected at least 2 send calls due to MAX_BATCH_SIZE clamping"
         );
 
-        // Drain and verify all received packets
-        let mut total_recv = 0;
-        let mut raw_bufs: Vec<Vec<u8>> = (0..64).map(|_| vec![0u8; 64]).collect();
-        while total_recv < total_packets {
-            let mut inbound: Vec<InboundDatagram<'_>> = raw_bufs
-                .iter_mut()
-                .map(|b| InboundDatagram::new(b.as_mut_slice()))
-                .collect();
-            let n = receiver.recv_many(&mut inbound).await?;
-            assert!(n > 0);
-            for d in &inbound[..n] {
-                assert_eq!(d.payload(), &payload[..]);
-                assert_eq!(d.source, Some(send_addr));
-            }
-            total_recv += n;
+        // Await concurrent receiver and verify packet sequence integrity
+        let received_payloads = rx_task.await.unwrap()?;
+        assert_eq!(received_payloads.len(), total_packets);
+        for (i, p) in received_payloads.iter().enumerate() {
+            assert_eq!(p, &payloads[i], "Packet {i} payload mismatch");
         }
-        assert_eq!(total_recv, total_packets);
 
         Ok::<(), io::Error>(())
     })
