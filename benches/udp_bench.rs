@@ -190,8 +190,8 @@ pub async fn run_throughput_bench(
 
     // Spawn receiver tasks with plain local integer counters
     let mut recv_handles = Vec::with_capacity(concurrency);
-    for i in 0..concurrency {
-        let r = receivers[i].clone();
+    for r in &receivers {
+        let r = r.clone();
         let mut shutdown_rx = shutdown_tx.subscribe();
         let barrier = start_barrier.clone();
 
