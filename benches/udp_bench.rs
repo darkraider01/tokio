@@ -45,6 +45,9 @@ pub struct BenchResult {
     pub p50_rtt_us: f64,
     pub p95_rtt_us: f64,
     pub p99_rtt_us: f64,
+    pub latency_samples: usize,
+    pub latency_timeouts: usize,
+    pub latency_invalid: usize,
     pub peak_rss_kb: i64,
     pub vol_cs: i64,
     pub invol_cs: i64,
@@ -150,7 +153,7 @@ pub async fn run_throughput_bench(
 
     let running = Arc::new(AtomicBool::new(true));
     let (shutdown_tx, _) = tokio::sync::watch::channel(false);
-    let start_barrier = Arc::new(tokio::sync::Barrier::new(concurrency * 2 + 1));
+    let start_barrier = Arc::new(tokio::sync::Barrier::new(concurrency * 2 + 2));
 
     // Warm-up phase (100ms): prime memory, kernel tables, and CPU caches.
     let warmup_running = Arc::new(AtomicBool::new(true));
@@ -355,25 +358,57 @@ pub async fn run_throughput_bench(
     });
 
     let probe_run2 = running.clone();
+    let probe_barrier = start_barrier.clone();
     let probe_h = tokio::spawn(async move {
+        probe_barrier.wait().await;
         let mut samples = Vec::with_capacity(300);
+        let mut timeouts = 0usize;
+        let mut invalid_replies = 0usize;
         let mut buf = [0u8; 512];
-        let ping_payload = [0x5Au8; 64];
+        let mut ping_payload = [0x5Au8; 64];
+        let mut seq = 0u64;
 
         while probe_run2.load(Ordering::Relaxed) {
-            let t0 = Instant::now();
-            let ping = tokio::time::timeout(Duration::from_millis(25), async {
-                probe_client.send_to(&ping_payload, probe_addr).await?;
-                probe_client.recv_from(&mut buf).await?;
-                Ok::<(), io::Error>(())
-            });
+            seq += 1;
+            ping_payload[0..8].copy_from_slice(&seq.to_be_bytes());
 
-            if let Ok(Ok(())) = ping.await {
-                samples.push(t0.elapsed().as_secs_f64() * 1_000_000.0);
+            let t0 = Instant::now();
+            let ping_res = tokio::time::timeout(Duration::from_millis(25), async {
+                probe_client.send_to(&ping_payload, probe_addr).await?;
+                loop {
+                    let (n, _) = probe_client.recv_from(&mut buf).await?;
+                    if n >= 8 {
+                        let resp_seq = u64::from_be_bytes(buf[0..8].try_into().unwrap());
+                        if resp_seq == seq {
+                            return Ok::<Duration, io::Error>(t0.elapsed());
+                        } else if resp_seq < seq {
+                            // Stale reply from an earlier timed-out request; drop and continue reading
+                            continue;
+                        } else {
+                            // Unexpected future sequence
+                            return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid probe seq"));
+                        }
+                    } else {
+                        return Err(io::Error::new(io::ErrorKind::InvalidData, "truncated probe reply"));
+                    }
+                }
+            })
+            .await;
+
+            match ping_res {
+                Ok(Ok(rtt)) => {
+                    samples.push(rtt.as_secs_f64() * 1_000_000.0);
+                }
+                Ok(Err(_)) => {
+                    invalid_replies += 1;
+                }
+                Err(_) => {
+                    timeouts += 1;
+                }
             }
             tokio::time::sleep(Duration::from_millis(2)).await;
         }
-        samples
+        (samples, timeouts, invalid_replies)
     });
 
     // Synchronize workers so all tasks release simultaneously at the start of measurement
@@ -406,11 +441,12 @@ pub async fn run_throughput_bench(
         }
     }
 
+    let (mut latency_samples, latency_timeouts, latency_invalid) =
+        match tokio::time::timeout(Duration::from_millis(100), probe_h).await {
+            Ok(Ok(stats)) => stats,
+            _ => (Vec::new(), 0, 0),
+        };
     probe_echo_h.abort();
-    let mut latency_samples = match tokio::time::timeout(Duration::from_millis(50), probe_h).await {
-        Ok(Ok(samples)) => samples,
-        _ => Vec::new(),
-    };
 
     // Drain any remaining buffered packets from the kernel queues
     let mut drained_recv = 0u64;
@@ -499,6 +535,9 @@ pub async fn run_throughput_bench(
         p50_rtt_us: p50,
         p95_rtt_us: p95,
         p99_rtt_us: p99,
+        latency_samples: latency_samples.len(),
+        latency_timeouts,
+        latency_invalid,
         peak_rss_kb,
         vol_cs,
         invol_cs,
@@ -509,9 +548,9 @@ pub async fn run_throughput_bench(
 
 fn print_header() {
     println!(
-        "| Mode | PktSz | Conc | Pkts/sec | MByte/s | CPU% (U+S) | CPU-ns/Pkt | IO-Ops/Pkt | Loss % | p50 (us) | p95 (us) | p99 (us) | Peak RSS |"
+        "| Mode | PktSz | Conc | Pkts/sec | MByte/s | CPU% (U+S) | CPU-ns/Pkt | IO-Ops/Pkt | Loss % | p50 (us) | p95 (us) | p99 (us) | Pings (TO) | Peak RSS |"
     );
-    println!("|:---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|");
+    println!("|:---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|");
 }
 
 fn print_result(r: &BenchResult) {
@@ -520,8 +559,9 @@ fn print_result(r: &BenchResult) {
         Mode::Grouped(b) => format!("Group-{}", b),
         Mode::Batched(b) => format!("Batch-{}", b),
     };
+    let pings_str = format!("{}/{}", r.latency_samples, r.latency_timeouts);
     println!(
-        "| {:<10} | {:>5} | {:>4} | {:>10.0} | {:>7.2} | {:>5.1}% ({:>4.1}+{:<4.1}) | {:>10.0} | {:>12.2} | {:>5.2}% | {:>8.1} | {:>8.1} | {:>8.1} | {:>7} KB |",
+        "| {:<10} | {:>5} | {:>4} | {:>10.0} | {:>7.2} | {:>5.1}% ({:>4.1}+{:<4.1}) | {:>10.0} | {:>12.2} | {:>5.2}% | {:>8.1} | {:>8.1} | {:>8.1} | {:>10} | {:>7} KB |",
         mode_str,
         r.packet_size,
         r.concurrency,
@@ -536,6 +576,7 @@ fn print_result(r: &BenchResult) {
         r.p50_rtt_us,
         r.p95_rtt_us,
         r.p99_rtt_us,
+        pings_str,
         r.peak_rss_kb,
     );
 }
