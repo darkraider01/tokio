@@ -876,29 +876,44 @@ async fn test_cancellation_waker_handover() -> io::Result<()> {
         let recv_addr = receiver.local_addr()?;
         let send_addr = sender.local_addr()?;
 
+        // Step 1: Start Task 1 and deterministically observe that it polls and returns Pending
         let rx1 = receiver.clone();
-        let ready_barrier = Arc::new(tokio::sync::Barrier::new(2));
-        let b1 = ready_barrier.clone();
-
-        // Task 1: starts waiting on empty socket, then is aborted
+        let polled1 = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let polled1_clone = polled1.clone();
         let task1 = tokio::spawn(async move {
             let mut buf = [0u8; 64];
             let mut inbound = [InboundDatagram::new(&mut buf)];
-            b1.wait().await;
-            rx1.recv_many(&mut inbound).await
+            poll_fn(|cx| {
+                polled1_clone.store(true, std::sync::atomic::Ordering::Release);
+                rx1.poll_recv_many(cx, &mut inbound)
+            })
+            .await
         });
 
-        ready_barrier.wait().await;
-        // Give task1 time to poll and register its waker on the socket
-        tokio::time::sleep(Duration::from_millis(15)).await;
-        task1.abort();
+        while !polled1.load(std::sync::atomic::Ordering::Acquire) {
+            tokio::task::yield_now().await;
+        }
 
-        // Task 2: starts receiving on the same socket after task 1 is cancelled
+        // Step 2: Abort Task 1 and await its cancellation completion to ensure clean waker release
+        task1.abort();
+        let join_res = task1.await;
+        assert!(
+            join_res.unwrap_err().is_cancelled(),
+            "Expected task1 to terminate with cancellation"
+        );
+
+        // Step 3: Start Task 2 on the same socket and confirm it is actively waiting
         let rx2 = receiver.clone();
+        let polled2 = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let polled2_clone = polled2.clone();
         let task2 = tokio::spawn(async move {
             let mut buf = [0u8; 64];
             let mut inbound = [InboundDatagram::new(&mut buf)];
-            let n = rx2.recv_many(&mut inbound).await?;
+            let n = poll_fn(|cx| {
+                polled2_clone.store(true, std::sync::atomic::Ordering::Release);
+                rx2.poll_recv_many(cx, &mut inbound)
+            })
+            .await?;
             Ok::<(usize, Vec<u8>, Option<std::net::SocketAddr>), io::Error>((
                 n,
                 inbound[0].payload().to_vec(),
@@ -906,9 +921,11 @@ async fn test_cancellation_waker_handover() -> io::Result<()> {
             ))
         });
 
-        tokio::time::sleep(Duration::from_millis(15)).await;
+        while !polled2.load(std::sync::atomic::Ordering::Acquire) {
+            tokio::task::yield_now().await;
+        }
 
-        // Now send datagram; task 2 must be awakened despite task 1 being aborted
+        // Step 4: Transmit datagram; Task 2 must wake cleanly despite previous task cancellation
         sender
             .send_many(&[Datagram::to_addr(b"waker handover", recv_addr)])
             .await?;
