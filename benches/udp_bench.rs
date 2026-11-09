@@ -48,9 +48,9 @@ mod linux {
         /// Proxy metric for system call efficiency: successful socket operations per delivered packet.
         pub io_ops_per_pkt: f64,
         pub packet_loss_pct: f64,
-        pub p50_rtt_us: f64,
-        pub p95_rtt_us: f64,
-        pub p99_rtt_us: f64,
+        pub p50_rtt_us: Option<f64>,
+        pub p95_rtt_us: Option<f64>,
+        pub p99_rtt_us: Option<f64>,
         pub latency_samples: usize,
         pub latency_timeouts: usize,
         pub latency_invalid: usize,
@@ -503,11 +503,29 @@ mod linux {
         }
 
         let (mut latency_samples, latency_timeouts, latency_invalid) =
-            match tokio::time::timeout(Duration::from_millis(100), probe_h).await {
+            match tokio::time::timeout(Duration::from_millis(500), probe_h).await {
                 Ok(Ok(stats)) => stats,
-                _ => (Vec::new(), 0, 0),
+                Ok(Err(panic_err)) => {
+                    if worker_error.is_none() {
+                        worker_error = Some(io::Error::new(
+                            io::ErrorKind::Other,
+                            format!("Latency probe task panicked: {panic_err}"),
+                        ));
+                    }
+                    (Vec::new(), 0, 0)
+                }
+                Err(_) => {
+                    if worker_error.is_none() {
+                        worker_error = Some(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "Latency probe task join timed out",
+                        ));
+                    }
+                    (Vec::new(), 0, 0)
+                }
             };
         probe_echo_h.abort();
+        let _ = probe_echo_h.await;
 
         // Invalidate run if any worker encountered an unexpected failure
         if let Some(err) = worker_error {
@@ -566,12 +584,12 @@ mod linux {
         let (p50, p95, p99) = if !latency_samples.is_empty() {
             latency_samples.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
             (
-                latency_samples[latency_samples.len() * 50 / 100],
-                latency_samples[latency_samples.len() * 95 / 100],
-                latency_samples[latency_samples.len() * 99 / 100],
+                Some(latency_samples[latency_samples.len() * 50 / 100]),
+                Some(latency_samples[latency_samples.len() * 95 / 100]),
+                Some(latency_samples[latency_samples.len() * 99 / 100]),
             )
         } else {
-            (0.0, 0.0, 0.0)
+            (None, None, None)
         };
 
         Ok(BenchResult {
@@ -623,9 +641,28 @@ mod linux {
             Mode::Grouped(b) => format!("Group-{}", b),
             Mode::Batched(b) => format!("Batch-{}", b),
         };
-        let pings_str = format!("{}/{}", r.latency_samples, r.latency_timeouts);
+        let pings_str = if r.latency_invalid > 0 {
+            format!(
+                "{}/{}(+{})",
+                r.latency_samples, r.latency_timeouts, r.latency_invalid
+            )
+        } else {
+            format!("{}/{}", r.latency_samples, r.latency_timeouts)
+        };
+        let p50_str = match r.p50_rtt_us {
+            Some(v) => format!("{:>8.1}", v),
+            None => "     N/A".to_string(),
+        };
+        let p95_str = match r.p95_rtt_us {
+            Some(v) => format!("{:>8.1}", v),
+            None => "     N/A".to_string(),
+        };
+        let p99_str = match r.p99_rtt_us {
+            Some(v) => format!("{:>8.1}", v),
+            None => "     N/A".to_string(),
+        };
         println!(
-        "| {:<10} | {:>5} | {:>4} | {:>10.0} | {:>7.2} | {:>5.1}% ({:>4.1}+{:<4.1}) | {:>10.0} | {:>12.2} | {:>5.2}% | {:>8.1} | {:>8.1} | {:>8.1} | {:>10} | {:>7} KB |",
+        "| {:<10} | {:>5} | {:>4} | {:>10.0} | {:>7.2} | {:>5.1}% ({:>4.1}+{:<4.1}) | {:>10.0} | {:>12.2} | {:>5.2}% | {} | {} | {} | {:>10} | {:>7} KB |",
         mode_str,
         r.packet_size,
         r.concurrency,
@@ -637,9 +674,9 @@ mod linux {
         r.cpu_ns_per_pkt,
         r.io_ops_per_pkt,
         r.packet_loss_pct,
-        r.p50_rtt_us,
-        r.p95_rtt_us,
-        r.p99_rtt_us,
+        p50_str,
+        p95_str,
+        p99_str,
         pings_str,
         r.peak_rss_kb,
     );
