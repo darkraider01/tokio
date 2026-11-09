@@ -22,9 +22,12 @@ pub const STACK_BATCH_SIZE: usize = 64;
 /// Upper bound on the number of datagrams processed in a single system call.
 ///
 /// Corresponds to Linux kernel `UIO_MAXIOV` (1024), which is the internal limit
-/// enforced by `sendmmsg(2)` and `recvmmsg(2)`. Clamping at this boundary guarantees
-/// bounded header allocations and preserves task scheduling fairness by preventing a
-/// single asynchronous poll from monopolizing a Tokio worker thread.
+/// enforced by `sendmmsg(2)` and `recvmmsg(2)`. Clamping at this boundary bounds
+/// internal header buffer allocations and prevents exceeding the kernel parameter limit.
+/// Note that clamping syscall batch size bounds individual call duration but does not alone
+/// guarantee cooperative task scheduling fairness; callers processing continuous high-rate
+/// traffic should yield periodically (e.g. via [`tokio::task::yield_now`]) to avoid monopolizing
+/// a Tokio worker thread.
 pub const MAX_BATCH_SIZE: usize = 1024;
 
 /// An outbound UDP datagram for batched transmission.
