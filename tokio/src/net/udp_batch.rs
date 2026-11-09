@@ -15,15 +15,16 @@ use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::os::fd::AsRawFd;
 use std::task::{ready, Context, Poll};
 
-/// Maximum batch size allocated on the stack to avoid heap allocations
-/// on the hot path while keeping stack frames bounded.
+/// Maximum batch size allocated on the stack (`[MaybeUninit<libc::mmsghdr>; 64]`) to eliminate
+/// heap allocations on the hot path while keeping stack frames bounded.
 pub const STACK_BATCH_SIZE: usize = 64;
 
 /// Upper bound on the number of datagrams processed in a single system call.
 ///
-/// Bounded by Linux `UIO_MAXIOV` (1024) to avoid kernel `EINVAL`, and to preserve
-/// task scheduling fairness by preventing a single asynchronous poll from
-/// monopolizing a worker thread for an unbounded batch.
+/// Corresponds to Linux kernel `UIO_MAXIOV` (1024), which is the internal limit
+/// enforced by `sendmmsg(2)` and `recvmmsg(2)`. Clamping at this boundary guarantees
+/// bounded header allocations and preserves task scheduling fairness by preventing a
+/// single asynchronous poll from monopolizing a Tokio worker thread.
 pub const MAX_BATCH_SIZE: usize = 1024;
 
 /// An outbound UDP datagram for batched transmission.
@@ -100,10 +101,15 @@ impl<'a> InboundDatagram<'a> {
 pub trait UdpSocketBatchExt {
     /// Sends multiple datagrams using Linux `sendmmsg(2)`.
     ///
+    /// At most `packets.len().min(MAX_BATCH_SIZE)` datagrams are submitted in a single
+    /// operation. Batches up to [`STACK_BATCH_SIZE`] (64) use stack-allocated headers;
+    /// larger batches dynamically allocate header storage.
+    ///
     /// Returns the number of datagrams successfully transmitted. This may be
-    /// less than `packets.len()` if the socket buffer becomes full (partial send)
-    /// or if `packets.len() > MAX_BATCH_SIZE`. Callers should inspect the return
-    /// value and advance their slice accordingly.
+    /// less than `packets.len()` if the socket send buffer becomes full (partial send)
+    /// or if `packets.len() > MAX_BATCH_SIZE`. Callers sending large streams should
+    /// inspect the return value, advance their slice accordingly, and yield periodically
+    /// to preserve cooperative scheduling fairness.
     fn send_many(
         &self,
         packets: &[Datagram<'_>],
@@ -111,10 +117,11 @@ pub trait UdpSocketBatchExt {
 
     /// Attempts to send multiple datagrams without blocking.
     ///
+    /// Clamps batch processing to `packets.len().min(MAX_BATCH_SIZE)`.
     /// If the socket is not ready to write, returns `Err(io::ErrorKind::WouldBlock)`.
     fn try_send_many(&self, packets: &[Datagram<'_>]) -> io::Result<usize>;
 
-    /// Polls the socket for batched write readiness and transmits up to `packets.len()` datagrams.
+    /// Polls the socket for batched write readiness and transmits up to `packets.len().min(MAX_BATCH_SIZE)` datagrams.
     fn poll_send_many(
         &self,
         cx: &mut Context<'_>,
@@ -124,7 +131,12 @@ pub trait UdpSocketBatchExt {
     /// Receives multiple datagrams using Linux `recvmmsg(2)`.
     ///
     /// Drains available datagrams into `packets` up to `packets.len().min(MAX_BATCH_SIZE)`.
-    /// Returns the number of datagrams received.
+    /// Batches up to [`STACK_BATCH_SIZE`] (64) use stack-allocated headers; larger
+    /// batches dynamically allocate header storage.
+    ///
+    /// Returns the number of datagrams received. Callers receiving continuous streams
+    /// should advance their buffer slices and yield periodically to maintain worker
+    /// scheduling fairness.
     fn recv_many(
         &self,
         packets: &mut [InboundDatagram<'_>],
@@ -132,10 +144,11 @@ pub trait UdpSocketBatchExt {
 
     /// Attempts to receive multiple datagrams without blocking.
     ///
+    /// Clamps batch processing to `packets.len().min(MAX_BATCH_SIZE)`.
     /// If no datagrams are available, returns `Err(io::ErrorKind::WouldBlock)`.
     fn try_recv_many(&self, packets: &mut [InboundDatagram<'_>]) -> io::Result<usize>;
 
-    /// Polls the socket for batched read readiness and receives available datagrams.
+    /// Polls the socket for batched read readiness and receives up to `packets.len().min(MAX_BATCH_SIZE)` datagrams.
     fn poll_recv_many(
         &self,
         cx: &mut Context<'_>,
