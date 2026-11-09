@@ -115,7 +115,7 @@ mod linux {
         /// Number of successful socket I/O operations (recvfrom or recvmmsg calls).
         pub successful_io_recvs: u64,
         pub pps: f64,
-        pub mbps: f64,
+        pub mib_per_sec: f64,
         pub user_cpu_pct: f64,
         pub sys_cpu_pct: f64,
         pub total_cpu_pct: f64,
@@ -139,7 +139,7 @@ mod linux {
 
     impl BenchResult {
         pub fn csv_header() -> &'static str {
-            "mode,packet_size,concurrency,elapsed_ms,packets_sent,packets_recv_timed,packets_drained,total_recv,bytes_recv,pps,mbps,cpu_user_pct,cpu_sys_pct,cpu_total_pct,cpu_ns_per_pkt,io_ops_per_pkt,packet_loss_pct,p50_rtt_us,p95_rtt_us,p99_rtt_us,latency_samples,latency_timeouts,latency_invalid,peak_rss_kb\n"
+            "mode,packet_size,concurrency,elapsed_ms,packets_sent,packets_recv_timed,packets_drained,total_recv,bytes_recv,pps,mib_per_sec,cpu_user_pct,cpu_sys_pct,cpu_total_pct,cpu_ns_per_pkt,io_ops_per_pkt,packet_loss_pct,p50_rtt_us,p95_rtt_us,p99_rtt_us,latency_samples,latency_timeouts,latency_invalid,peak_rss_kb\n"
         }
 
         pub fn to_csv_row(&self) -> String {
@@ -160,7 +160,7 @@ mod linux {
                 self.total_recv,
                 self.bytes_recv,
                 self.pps,
-                self.mbps,
+                self.mib_per_sec,
                 self.user_cpu_pct,
                 self.sys_cpu_pct,
                 self.total_cpu_pct,
@@ -184,7 +184,7 @@ mod linux {
                 Mode::Batched(b) => &format!("batched_{b}"),
             };
             format!(
-                "{{\"mode\":\"{}\",\"packet_size\":{},\"concurrency\":{},\"elapsed_ms\":{:.3},\"packets_sent\":{},\"packets_recv_timed\":{},\"packets_drained\":{},\"total_recv\":{},\"bytes_recv\":{},\"pps\":{:.2},\"mbps\":{:.2},\"cpu_user_pct\":{:.2},\"cpu_sys_pct\":{:.2},\"cpu_total_pct\":{:.2},\"cpu_ns_per_pkt\":{:.2},\"io_ops_per_pkt\":{:.2},\"packet_loss_pct\":{:.2},\"p50_rtt_us\":{},\"p95_rtt_us\":{},\"p99_rtt_us\":{},\"latency_samples\":{},\"latency_timeouts\":{},\"latency_invalid\":{},\"peak_rss_kb\":{}}}",
+                "{{\"mode\":\"{}\",\"packet_size\":{},\"concurrency\":{},\"elapsed_ms\":{:.3},\"packets_sent\":{},\"packets_recv_timed\":{},\"packets_drained\":{},\"total_recv\":{},\"bytes_recv\":{},\"pps\":{:.2},\"mib_per_sec\":{:.2},\"cpu_user_pct\":{:.2},\"cpu_sys_pct\":{:.2},\"cpu_total_pct\":{:.2},\"cpu_ns_per_pkt\":{:.2},\"io_ops_per_pkt\":{:.2},\"packet_loss_pct\":{:.2},\"p50_rtt_us\":{},\"p95_rtt_us\":{},\"p99_rtt_us\":{},\"latency_samples\":{},\"latency_timeouts\":{},\"latency_invalid\":{},\"peak_rss_kb\":{}}}",
                 mode_str,
                 self.packet_size,
                 self.concurrency,
@@ -195,7 +195,7 @@ mod linux {
                 self.total_recv,
                 self.bytes_recv,
                 self.pps,
-                self.mbps,
+                self.mib_per_sec,
                 self.user_cpu_pct,
                 self.sys_cpu_pct,
                 self.total_cpu_pct,
@@ -714,7 +714,7 @@ mod linux {
 
         let pps = (timed_recv as f64) / duration_sec;
         let bytes_recv = timed_recv * (packet_size as u64);
-        let mbps = (bytes_recv as f64) / (1024.0 * 1024.0 * duration_sec);
+        let mib_per_sec = (bytes_recv as f64) / (1024.0 * 1024.0 * duration_sec);
 
         let total_cpu_time = utime_diff + stime_diff;
         let cpu_ns_per_pkt = if timed_recv > 0 {
@@ -763,7 +763,7 @@ mod linux {
             successful_io_sends: send_io_ops,
             successful_io_recvs: recv_io_ops,
             pps,
-            mbps,
+            mib_per_sec,
             user_cpu_pct,
             sys_cpu_pct,
             total_cpu_pct,
@@ -810,7 +810,7 @@ mod linux {
 
     fn print_header() {
         println!(
-        "| Mode | PktSz | Conc | Pkts/sec | MByte/s | CPU% (U+S) | CPU-ns/Pkt | IO-Ops/Pkt | Loss % | p50 (us) | p95 (us) | p99 (us) | Pings (TO) | Peak RSS |"
+        "| Mode | PktSz | Conc | Pkts/sec |  MiB/s  | CPU% (U+S) | CPU-ns/Pkt | IO-Ops/Pkt | Loss % | p50 (us) | p95 (us) | p99 (us) | Pings (TO) | Peak RSS |"
     );
         println!(
             "|:---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|"
@@ -849,7 +849,7 @@ mod linux {
         r.packet_size,
         r.concurrency,
         r.pps,
-        r.mbps,
+        r.mib_per_sec,
         r.total_cpu_pct,
         r.user_cpu_pct,
         r.sys_cpu_pct,
