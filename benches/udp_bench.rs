@@ -18,6 +18,7 @@ mod linux {
         pub probe_timeout: Duration,
         pub min_latency_samples: usize,
         pub trials: usize,
+        pub seed: u64,
         pub csv_path: Option<String>,
         pub json_path: Option<String>,
     }
@@ -31,6 +32,7 @@ mod linux {
                 probe_timeout: Duration::from_millis(25),
                 min_latency_samples: 10,
                 trials: 1,
+                seed: 42,
                 csv_path: None,
                 json_path: None,
             }
@@ -70,6 +72,11 @@ mod linux {
                     if n > 0 {
                         cfg.trials = n;
                     }
+                }
+            }
+            if let Ok(v) = std::env::var("UDP_BENCH_SEED") {
+                if let Ok(s) = v.parse::<u64>() {
+                    cfg.seed = s;
                 }
             }
             if let Ok(path) = std::env::var("UDP_BENCH_CSV") {
@@ -977,22 +984,68 @@ mod linux {
         })
     }
 
+    fn deterministic_permute(n: usize, seed: u64) -> Vec<usize> {
+        let mut indices: Vec<usize> = (0..n).collect();
+        let mut state = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        for i in (1..n).rev() {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let j = ((state >> 32) as usize) % (i + 1);
+            indices.swap(i, j);
+        }
+        indices
+    }
+
+    /// Runs a batch of benchmark cases using interleaved execution across trial rounds to
+    /// eliminate thermal throttling and CPU frequency scaling bias.
+    pub async fn run_cases(
+        cases: &[(Mode, usize, usize)],
+        config: &BenchConfig,
+    ) -> io::Result<Vec<BenchSummary>> {
+        let n = cases.len();
+        if n == 0 {
+            return Ok(Vec::new());
+        }
+
+        let mut trial_collectors: Vec<Vec<TrialResult>> =
+            vec![Vec::with_capacity(config.trials); n];
+
+        for trial_index in 0..config.trials {
+            // Generate deterministic permutation of cases for this trial round
+            let round_seed = config
+                .seed
+                .wrapping_add((trial_index as u64).wrapping_mul(0x9E3779B97F4A7C15));
+            let order = deterministic_permute(n, round_seed);
+
+            for &case_idx in &order {
+                let (mode, pkt_size, conc) = cases[case_idx];
+                let res = run_throughput_bench(mode, pkt_size, conc, trial_index, config).await?;
+                trial_collectors[case_idx].push(res);
+                if config.trials > 1 {
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+            }
+        }
+
+        let mut summaries = Vec::with_capacity(n);
+        for trials in trial_collectors {
+            summaries.push(BenchSummary::from_trials(trials));
+        }
+        Ok(summaries)
+    }
+
+    #[allow(dead_code)]
     pub async fn run_bench(
         mode: Mode,
         packet_size: usize,
         concurrency: usize,
         config: &BenchConfig,
     ) -> io::Result<BenchSummary> {
-        let mut trials = Vec::with_capacity(config.trials);
-        for trial_index in 0..config.trials {
-            let res =
-                run_throughput_bench(mode, packet_size, concurrency, trial_index, config).await?;
-            trials.push(res);
-            if config.trials > 1 && trial_index + 1 < config.trials {
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            }
-        }
-        Ok(BenchSummary::from_trials(trials))
+        let summaries = run_cases(&[(mode, packet_size, concurrency)], config).await?;
+        Ok(summaries.into_iter().next().unwrap())
     }
 
     fn print_header() {
@@ -1076,8 +1129,8 @@ mod linux {
         let config = BenchConfig::from_env();
         if config.trials > 1 {
             println!(
-                "Running with {} trials per benchmark case (reporting median).",
-                config.trials
+                "Running with {} trials per benchmark case (interleaved deterministic ordering, seed: {}).",
+                config.trials, config.seed
             );
             println!();
         }
@@ -1092,44 +1145,43 @@ mod linux {
             "### PART 1: Baseline Tokio UDP Operations (Single-Packet async send_to/recv_from)"
         );
         print_header();
+        let mut s1_cases = Vec::new();
         for &pkt in &packet_sizes {
             for &conc in &concurrencies {
-                let res = run_bench(Mode::Baseline, pkt, conc, &config).await?;
-                print_result(&res);
-                all_results.push(res);
+                s1_cases.push((Mode::Baseline, pkt, conc));
             }
+        }
+        for s in run_cases(&s1_cases, &config).await? {
+            print_result(&s);
+            all_results.push(s);
         }
         println!();
 
         // Section 2: Three-Way Comparison: Baseline vs Grouped vs Batched (64B packets, 16x16 concurrency)
         println!("### PART 2: Three-Way Comparison (Packet Size: 64B, Concurrency: 16x16)");
         print_header();
-        let b_res = run_bench(Mode::Baseline, 64, 16, &config).await?;
-        print_result(&b_res);
-        all_results.push(b_res);
+        let mut s2_cases = vec![(Mode::Baseline, 64, 16)];
         for &bs in &batch_sizes {
-            let g_res = run_bench(Mode::Grouped(bs), 64, 16, &config).await?;
-            print_result(&g_res);
-            all_results.push(g_res);
-            let res = run_bench(Mode::Batched(bs), 64, 16, &config).await?;
-            print_result(&res);
-            all_results.push(res);
+            s2_cases.push((Mode::Grouped(bs), 64, 16));
+            s2_cases.push((Mode::Batched(bs), 64, 16));
+        }
+        for s in run_cases(&s2_cases, &config).await? {
+            print_result(&s);
+            all_results.push(s);
         }
         println!();
 
         // Section 3: Three-Way Comparison: Baseline vs Grouped vs Batched (1472B packets, 16x16 concurrency)
         println!("### PART 3: Three-Way Comparison (Packet Size: 1472B, Concurrency: 16x16)");
         print_header();
-        let b_res1472 = run_bench(Mode::Baseline, 1472, 16, &config).await?;
-        print_result(&b_res1472);
-        all_results.push(b_res1472);
+        let mut s3_cases = vec![(Mode::Baseline, 1472, 16)];
         for &bs in &batch_sizes {
-            let g_res = run_bench(Mode::Grouped(bs), 1472, 16, &config).await?;
-            print_result(&g_res);
-            all_results.push(g_res);
-            let res = run_bench(Mode::Batched(bs), 1472, 16, &config).await?;
-            print_result(&res);
-            all_results.push(res);
+            s3_cases.push((Mode::Grouped(bs), 1472, 16));
+            s3_cases.push((Mode::Batched(bs), 1472, 16));
+        }
+        for s in run_cases(&s3_cases, &config).await? {
+            print_result(&s);
+            all_results.push(s);
         }
         println!();
 
@@ -1138,34 +1190,32 @@ mod linux {
             "### PART 4: Concurrency Scaling (Packet Size: 64B: Baseline vs Group-32 vs Batch-32)"
         );
         print_header();
+        let mut s4_cases = Vec::new();
         for &conc in &concurrencies {
-            let b = run_bench(Mode::Baseline, 64, conc, &config).await?;
-            print_result(&b);
-            all_results.push(b);
-            let g = run_bench(Mode::Grouped(32), 64, conc, &config).await?;
-            print_result(&g);
-            all_results.push(g);
-            let batched = run_bench(Mode::Batched(32), 64, conc, &config).await?;
-            print_result(&batched);
-            all_results.push(batched);
+            s4_cases.push((Mode::Baseline, 64, conc));
+            s4_cases.push((Mode::Grouped(32), 64, conc));
+            s4_cases.push((Mode::Batched(32), 64, conc));
+        }
+        for s in run_cases(&s4_cases, &config).await? {
+            print_result(&s);
+            all_results.push(s);
         }
         println!();
 
         // Section 5: Concurrency Scaling (Packet Size: 1472B): Baseline vs Group-32 vs Batch-32
         println!(
-        "### PART 5: Concurrency Scaling (Packet Size: 1472B: Baseline vs Group-32 vs Batch-32)"
-    );
+            "### PART 5: Concurrency Scaling (Packet Size: 1472B: Baseline vs Group-32 vs Batch-32)"
+        );
         print_header();
+        let mut s5_cases = Vec::new();
         for &conc in &concurrencies {
-            let b = run_bench(Mode::Baseline, 1472, conc, &config).await?;
-            print_result(&b);
-            all_results.push(b);
-            let g = run_bench(Mode::Grouped(32), 1472, conc, &config).await?;
-            print_result(&g);
-            all_results.push(g);
-            let batched = run_bench(Mode::Batched(32), 1472, conc, &config).await?;
-            print_result(&batched);
-            all_results.push(batched);
+            s5_cases.push((Mode::Baseline, 1472, conc));
+            s5_cases.push((Mode::Grouped(32), 1472, conc));
+            s5_cases.push((Mode::Batched(32), 1472, conc));
+        }
+        for s in run_cases(&s5_cases, &config).await? {
+            print_result(&s);
+            all_results.push(s);
         }
         println!();
 
