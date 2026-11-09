@@ -185,10 +185,28 @@ mod linux {
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
         warmup_running.store(false, Ordering::Relaxed);
-        for h in warmup_handles {
+        for h in &warmup_handles {
             h.abort();
         }
-        // Drain any remaining warmup packets
+        for (i, h) in warmup_handles.into_iter().enumerate() {
+            match tokio::time::timeout(Duration::from_millis(200), h).await {
+                Ok(Ok(_)) => {}                                    // Clean exit
+                Ok(Err(join_err)) if join_err.is_cancelled() => {} // Expected cancellation
+                Ok(Err(join_err)) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Other,
+                        format!("Warmup task {i} panicked: {join_err}"),
+                    ));
+                }
+                Err(_) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        format!("Warmup task {i} failed to terminate within timeout"),
+                    ));
+                }
+            }
+        }
+        // Drain all remaining warmup packets completely after all tasks have stopped
         for r in &receivers {
             let mut drain_buf = [0u8; 2048];
             while r.try_recv_from(&mut drain_buf).is_ok() {}
