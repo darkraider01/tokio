@@ -310,12 +310,11 @@ As contributors to the Tokio runtime, the following architectural invariants gui
 1. **The Cross-Platform Invariant**:
    `tokio::net::UdpSocket` is a cross-platform foundation mirroring `std::net::UdpSocket`. Adding Linux-specific batching methods and types directly to `tokio::net::UdpSocket` would fragment the API across Windows, macOS, and BSDs.
 2. **Upstream Precedents**:
-   Mio leads (issues #1839, #1786) and Tokio maintainers (#3000, #2968) have repeatedly resolved that specialized multi-message socket calls do not belong in Tokio core. Carl Lerche explicitly stated:
-   > *"Tokio provides readiness primitives (`ready`, `poll_*_ready`, `try_io`, `async_io`) rather than wrapping every platform-specific socket syscall."*
+   Mio and Tokio maintainer discussions (such as `tokio-rs/tokio` #3000 and #2968 regarding edge-triggered readiness clearing, and `tokio-rs/mio` #1786 and #1839 regarding OS-specific socket extensions) have consistently emphasized that Tokio core provides portable readiness primitives (`ready`, `poll_*_ready`, `try_io`, `async_io`) rather than wrapping every platform-specific socket syscall. The `try_io` and `async_io` APIs were designed specifically to allow downstream libraries to execute platform-specialized I/O without bloating runtime core.
 3. **Zero Private Runtime Privileges**:
-   This prototype proves that native Linux batched UDP requires **zero private runtime fields or internal hooks**. It operates entirely on public APIs: `AsRawFd`, `try_io`, and `async_io`.
-4. **MSRV Discipline**:
-   Tokio cannot adopt RPITIT in core traits without bumping MSRV to 1.75+, which requires an explicit runtime-wide policy decision.
+   This prototype proves that native Linux batched UDP requires **zero private runtime fields or internal hooks**. It operates entirely on public APIs: `AsRawFd`, `try_io`, and `async_io`. Any crate in the ecosystem can implement this exact batching logic with identical performance.
+4. **API Stability and Separation of Concerns**:
+   Tokio core adheres to strict 1.x stability guarantees. Specialized networking syscalls (`sendmmsg`, `recvmmsg`, GSO, GRO) often evolve alongside kernel capabilities and application needs (e.g., QUIC requirements for ECN and timestamps). Housing these abstractions outside Tokio core allows rapid iteration and protocol-specific tuning without binding Tokio core to kernel ABI nuances.
 
 ---
 
@@ -324,13 +323,20 @@ As contributors to the Tokio runtime, the following architectural invariants gui
 > [!IMPORTANT]
 > **Verdict: Do NOT merge directly into `tokio::net::UdpSocket`.**
 >
-> Native Linux UDP batching (`sendmmsg`/`recvmmsg`) delivers massive user-space CPU savings (over 80%) and reduces kernel crossings by over 20×. However, because it requires zero internal runtime access and is platform-specific, it belongs in:
+> Native Linux UDP batching (`sendmmsg`/`recvmmsg`) delivers massive user-space CPU savings (over 80%) and reduces kernel crossings by over 20×. However, because it requires zero internal runtime access and is platform-specific, it belongs outside Tokio core:
 > 1. **`tokio-util`** as a platform-gated extension (e.g. `tokio_util::net::udp_batch`), or
-> 2. A dedicated community crate (e.g. `tokio-udp-batch`), or
-> 3. An established specialized networking library such as `quinn-udp`.
+> 2. **`quinn-udp`** or similar specialized transport crates for advanced networking stacks requiring GSO/GRO and ECN.
+
+### Architectural Comparison & Placement Evaluation
+
+| Placement Option | Evaluation & Tradeoffs | Recommended? |
+|:---|:---|:---:|
+| **Tokio Core (`tokio::net`)** | Would introduce Linux-only methods to a core cross-platform type; bloats MSRV/API surface; unnecessary given that no private runtime access is required. | ❌ No |
+| **`tokio-util` (`tokio_util::net::udp_batch`)** | Excellent choice if the Tokio project wants a first-party batched UDP abstraction. Allows `#[cfg(target_os = "linux")]` gating without fragmenting `tokio::net::UdpSocket`. |  Yes (Preferred for general batching) |
+| **Specialized Crates (`quinn-udp`)** | Best suited for complex protocols like QUIC that require GSO/GRO, ECN control messages, and multi-OS dynamic fallback. |  Yes (Preferred for QUIC/transport protocols) |
 
 ### Proposed Upstream Actions:
 1. **Submit to `tokio-util`**:
    Propose `tokio_util::net::udp_batch` providing `Datagram`, `InboundDatagram`, and `UdpSocketBatchExt` guarded by `#[cfg(target_os = "linux")]`.
 2. **Enhance Tokio UDP Documentation**:
-   Add an official cookbook recipe and example in `tokio::net::UdpSocket` demonstrating how high-performance applications can leverage `UdpSocket::async_io` and `UdpSocket::try_io` with `sendmmsg`/`recvmmsg` or `quinn-udp`.
+   Add an official cookbook recipe and documentation example in `tokio::net::UdpSocket` demonstrating how high-performance applications can leverage `UdpSocket::async_io` and `UdpSocket::try_io` with `sendmmsg`/`recvmmsg` or `quinn-udp`.
