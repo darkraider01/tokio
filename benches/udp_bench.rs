@@ -104,6 +104,9 @@ mod linux {
         pub mode: Mode,
         pub packet_size: usize,
         pub concurrency: usize,
+        /// Configured nominal measurement duration.
+        pub nominal_duration: Duration,
+        /// Actual elapsed duration from start barrier release until all workers have stopped and joined.
         pub elapsed: Duration,
         pub packets_sent: u64,
         pub packets_recv_timed: u64,
@@ -139,7 +142,7 @@ mod linux {
 
     impl BenchResult {
         pub fn csv_header() -> &'static str {
-            "mode,packet_size,concurrency,elapsed_ms,packets_sent,packets_recv_timed,packets_drained,total_recv,bytes_recv,pps,mib_per_sec,cpu_user_pct,cpu_sys_pct,cpu_total_pct,cpu_ns_per_pkt,io_ops_per_pkt,packet_loss_pct,p50_rtt_us,p95_rtt_us,p99_rtt_us,latency_samples,latency_timeouts,latency_invalid,peak_rss_kb\n"
+            "mode,packet_size,concurrency,nominal_duration_ms,elapsed_ms,packets_sent,packets_recv_timed,packets_drained,total_recv,bytes_recv,pps,mib_per_sec,cpu_user_pct,cpu_sys_pct,cpu_total_pct,cpu_ns_per_pkt,io_ops_per_pkt,packet_loss_pct,p50_rtt_us,p95_rtt_us,p99_rtt_us,latency_samples,latency_timeouts,latency_invalid,peak_rss_kb\n"
         }
 
         pub fn to_csv_row(&self) -> String {
@@ -149,10 +152,11 @@ mod linux {
                 Mode::Batched(b) => format!("batched_{b}"),
             };
             format!(
-                "{},{},{},{:.3},{},{},{},{},{},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{},{},{},{},{},{},{}\n",
+                "{},{},{},{:.3},{:.3},{},{},{},{},{},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{},{},{},{},{},{},{}\n",
                 mode_str,
                 self.packet_size,
                 self.concurrency,
+                self.nominal_duration.as_secs_f64() * 1000.0,
                 self.elapsed.as_secs_f64() * 1000.0,
                 self.packets_sent,
                 self.packets_recv_timed,
@@ -184,10 +188,11 @@ mod linux {
                 Mode::Batched(b) => &format!("batched_{b}"),
             };
             format!(
-                "{{\"mode\":\"{}\",\"packet_size\":{},\"concurrency\":{},\"elapsed_ms\":{:.3},\"packets_sent\":{},\"packets_recv_timed\":{},\"packets_drained\":{},\"total_recv\":{},\"bytes_recv\":{},\"pps\":{:.2},\"mib_per_sec\":{:.2},\"cpu_user_pct\":{:.2},\"cpu_sys_pct\":{:.2},\"cpu_total_pct\":{:.2},\"cpu_ns_per_pkt\":{:.2},\"io_ops_per_pkt\":{:.2},\"packet_loss_pct\":{:.2},\"p50_rtt_us\":{},\"p95_rtt_us\":{},\"p99_rtt_us\":{},\"latency_samples\":{},\"latency_timeouts\":{},\"latency_invalid\":{},\"peak_rss_kb\":{}}}",
+                "{{\"mode\":\"{}\",\"packet_size\":{},\"concurrency\":{},\"nominal_duration_ms\":{:.3},\"elapsed_ms\":{:.3},\"packets_sent\":{},\"packets_recv_timed\":{},\"packets_drained\":{},\"total_recv\":{},\"bytes_recv\":{},\"pps\":{:.2},\"mib_per_sec\":{:.2},\"cpu_user_pct\":{:.2},\"cpu_sys_pct\":{:.2},\"cpu_total_pct\":{:.2},\"cpu_ns_per_pkt\":{:.2},\"io_ops_per_pkt\":{:.2},\"packet_loss_pct\":{:.2},\"p50_rtt_us\":{},\"p95_rtt_us\":{},\"p99_rtt_us\":{},\"latency_samples\":{},\"latency_timeouts\":{},\"latency_invalid\":{},\"peak_rss_kb\":{}}}",
                 mode_str,
                 self.packet_size,
                 self.concurrency,
+                self.nominal_duration.as_secs_f64() * 1000.0,
                 self.elapsed.as_secs_f64() * 1000.0,
                 self.packets_sent,
                 self.packets_recv_timed,
@@ -588,20 +593,21 @@ mod linux {
             (samples, timeouts, invalid_replies)
         });
 
-        // Synchronize workers so all tasks release simultaneously at the start of measurement
-        start_barrier.wait().await;
-        let start_time = Instant::now();
+        // Sample process resource usage and timestamp immediately before releasing the barrier.
+        // As the coordinator is the final task to reach the barrier, no worker can execute
+        // any operations before this start timestamp.
         let rusage_start = get_rusage()?;
+        let start_time = Instant::now();
+        start_barrier.wait().await;
 
-        // Run measurement duration
+        // Run measurement for the configured nominal duration
         tokio::time::sleep(config.duration).await;
-        let measurement_stop_time = Instant::now();
-        let rusage_stop = get_rusage()?;
-        let actual_measurement_duration = measurement_stop_time.duration_since(start_time);
+        let nominal_stop_time = Instant::now();
+        let nominal_duration = nominal_stop_time.duration_since(start_time);
 
-        // Signal cooperative shutdown to both senders and receivers simultaneously
-        running.store(false, Ordering::Relaxed);
-        let _ = shutdown_tx.send(true);
+        // Two-phase coordinated shutdown:
+        // Phase 1: Halt sender generation so no new packets enter the network
+        running.store(false, Ordering::Release);
 
         let mut sent = 0u64;
         let mut send_io_ops = 0u64;
@@ -631,6 +637,9 @@ mod linux {
                 }
             }
         }
+
+        // Phase 2: Halt active receivers and wait for all tasks to terminate
+        let _ = shutdown_tx.send(true);
 
         let mut timed_recv = 0u64;
         let mut recv_io_ops = 0u64;
@@ -684,6 +693,13 @@ mod linux {
             };
         probe_echo_h.abort();
         let _ = probe_echo_h.await;
+
+        // Sample post-measurement timestamp and rusage immediately after all workers finish.
+        // This ensures every sent/received packet and every CPU microsecond are strictly
+        // contained within the [start_time, active_stop_time] window.
+        let active_stop_time = Instant::now();
+        let rusage_stop = get_rusage()?;
+        let actual_measurement_duration = active_stop_time.duration_since(start_time);
 
         // Invalidate run if any worker encountered an unexpected failure
         if let Some(err) = worker_error {
@@ -754,6 +770,7 @@ mod linux {
             mode,
             packet_size,
             concurrency,
+            nominal_duration,
             elapsed: actual_measurement_duration,
             packets_sent: sent,
             packets_recv_timed: timed_recv,
