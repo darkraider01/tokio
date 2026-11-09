@@ -648,3 +648,79 @@ async fn test_recv_many_heap_fallback() -> io::Result<()> {
     .await
     .expect("test timed out")
 }
+
+#[tokio::test]
+async fn test_partial_send_progress() -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+
+    time::timeout(TEST_TIMEOUT, async {
+        let sender = UdpSocket::bind("127.0.0.1:0").await?;
+        let receiver = UdpSocket::bind("127.0.0.1:0").await?;
+        let recv_addr = receiver.local_addr()?;
+        let send_addr = sender.local_addr()?;
+
+        // Configure receiver buffer to accommodate batch without kernel drop
+        unsafe {
+            let big_buf: libc::c_int = 4 * 1024 * 1024;
+            libc::setsockopt(
+                receiver.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_RCVBUF,
+                &big_buf as *const _ as *const libc::c_void,
+                std::mem::size_of_val(&big_buf) as libc::socklen_t,
+            );
+        }
+
+        // Verify partial send progress when batch exceeds MAX_BATCH_SIZE (1024).
+        // A batch of 1050 datagrams must transmit at most MAX_BATCH_SIZE in the first
+        // call, requiring the caller to advance their slice and send the remainder.
+        let total_packets = 1050;
+        let payload = [0xEEu8; 32];
+        let outbound: Vec<Datagram<'_>> = (0..total_packets)
+            .map(|_| Datagram::to_addr(&payload, recv_addr))
+            .collect();
+
+        let mut total_sent = 0;
+        let mut send_calls = 0;
+        while total_sent < total_packets {
+            let remaining = &outbound[total_sent..];
+            let sent = sender.send_many(remaining).await?;
+            assert!(sent > 0);
+            assert!(sent <= MAX_BATCH_SIZE);
+            if remaining.len() > MAX_BATCH_SIZE {
+                // Guaranteed partial send due to MAX_BATCH_SIZE clamping
+                assert_eq!(sent, MAX_BATCH_SIZE);
+            }
+            total_sent += sent;
+            send_calls += 1;
+        }
+
+        assert_eq!(total_sent, total_packets);
+        assert!(
+            send_calls >= 2,
+            "Expected at least 2 send calls due to MAX_BATCH_SIZE clamping"
+        );
+
+        // Drain and verify all received packets
+        let mut total_recv = 0;
+        let mut raw_bufs: Vec<Vec<u8>> = (0..64).map(|_| vec![0u8; 64]).collect();
+        while total_recv < total_packets {
+            let mut inbound: Vec<InboundDatagram<'_>> = raw_bufs
+                .iter_mut()
+                .map(|b| InboundDatagram::new(b.as_mut_slice()))
+                .collect();
+            let n = receiver.recv_many(&mut inbound).await?;
+            assert!(n > 0);
+            for d in &inbound[..n] {
+                assert_eq!(d.payload(), &payload[..]);
+                assert_eq!(d.source, Some(send_addr));
+            }
+            total_recv += n;
+        }
+        assert_eq!(total_recv, total_packets);
+
+        Ok::<(), io::Error>(())
+    })
+    .await
+    .expect("test timed out")
+}
