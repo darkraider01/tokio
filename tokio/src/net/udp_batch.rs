@@ -98,6 +98,14 @@ impl<'a> InboundDatagram<'a> {
 }
 
 /// Extension trait providing batched UDP transmission and reception on [`UdpSocket`].
+///
+/// # Upstream Design Note (MSRV Compatibility)
+///
+/// This experimental trait uses Return Position `impl Trait` in Trait (RPITIT), which
+/// requires Rust 1.75+. Upstream Tokio currently maintains an MSRV of Rust 1.71.0.
+/// If batched UDP I/O is proposed upstream, these operations should either be implemented
+/// as inherent methods on `UdpSocket` (supported on Rust 1.71.0) or return dedicated
+/// named future structs to preserve Tokio's MSRV guarantee.
 pub trait UdpSocketBatchExt {
     /// Sends multiple datagrams using Linux `sendmmsg(2)`.
     ///
@@ -122,6 +130,8 @@ pub trait UdpSocketBatchExt {
     fn try_send_many(&self, packets: &[Datagram<'_>]) -> io::Result<usize>;
 
     /// Polls the socket for batched write readiness and transmits up to `packets.len().min(MAX_BATCH_SIZE)` datagrams.
+    ///
+    /// If the socket is not ready for writing, registers the task waker and returns `Poll::Pending`.
     fn poll_send_many(
         &self,
         cx: &mut Context<'_>,
@@ -149,6 +159,8 @@ pub trait UdpSocketBatchExt {
     fn try_recv_many(&self, packets: &mut [InboundDatagram<'_>]) -> io::Result<usize>;
 
     /// Polls the socket for batched read readiness and receives up to `packets.len().min(MAX_BATCH_SIZE)` datagrams.
+    ///
+    /// If the socket is not ready for reading, registers the task waker and returns `Poll::Pending`.
     fn poll_recv_many(
         &self,
         cx: &mut Context<'_>,
@@ -291,7 +303,7 @@ fn setup_and_call_sendmmsg(
         // SAFETY: `iovec::iov_base` in POSIX is `*mut c_void`, but for `sendmmsg`/`sendmsg`
         // the kernel reads exclusively from the buffer. Casting `*const u8` to `*mut c_void`
         // does not violate Rust's aliasing rules because the underlying data is never mutated.
-        // `packets[i].buf` remains valid and pinned throughout the call.
+        // `packets[i].buf` is borrowed and remains valid for the duration of the syscall.
         unsafe {
             (*iov).iov_base = packets[i].buf.as_ptr() as *mut libc::c_void;
             (*iov).iov_len = packets[i].buf.len();
