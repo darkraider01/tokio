@@ -48,6 +48,8 @@ pub struct BenchResult {
     pub peak_rss_kb: i64,
     pub vol_cs: i64,
     pub invol_cs: i64,
+    pub effective_rcvbuf: usize,
+    pub effective_sndbuf: usize,
 }
 
 fn get_rusage() -> libc::rusage {
@@ -62,23 +64,58 @@ fn timeval_to_duration(tv: libc::timeval) -> Duration {
     Duration::from_secs(tv.tv_sec as u64) + Duration::from_micros(tv.tv_usec as u64)
 }
 
-fn configure_socket(sock: &UdpSocket) {
+fn configure_socket(sock: &UdpSocket) -> io::Result<(usize, usize)> {
     let buf_size: libc::c_int = 2 * 1024 * 1024;
     unsafe {
-        libc::setsockopt(
+        let ret = libc::setsockopt(
             sock.as_raw_fd(),
             libc::SOL_SOCKET,
             libc::SO_RCVBUF,
             &buf_size as *const _ as *const libc::c_void,
             std::mem::size_of_val(&buf_size) as libc::socklen_t,
         );
-        libc::setsockopt(
+        if ret != 0 {
+            return Err(io::Error::last_os_error());
+        }
+
+        let ret = libc::setsockopt(
             sock.as_raw_fd(),
             libc::SOL_SOCKET,
             libc::SO_SNDBUF,
             &buf_size as *const _ as *const libc::c_void,
             std::mem::size_of_val(&buf_size) as libc::socklen_t,
         );
+        if ret != 0 {
+            return Err(io::Error::last_os_error());
+        }
+
+        let mut actual_rcv: libc::c_int = 0;
+        let mut len = std::mem::size_of_val(&actual_rcv) as libc::socklen_t;
+        let ret = libc::getsockopt(
+            sock.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_RCVBUF,
+            &mut actual_rcv as *mut _ as *mut libc::c_void,
+            &mut len,
+        );
+        if ret != 0 {
+            return Err(io::Error::last_os_error());
+        }
+
+        let mut actual_snd: libc::c_int = 0;
+        let mut len = std::mem::size_of_val(&actual_snd) as libc::socklen_t;
+        let ret = libc::getsockopt(
+            sock.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_SNDBUF,
+            &mut actual_snd as *mut _ as *mut libc::c_void,
+            &mut len,
+        );
+        if ret != 0 {
+            return Err(io::Error::last_os_error());
+        }
+
+        Ok((actual_rcv as usize, actual_snd as usize))
     }
 }
 
@@ -92,9 +129,13 @@ pub async fn run_throughput_bench(
     // Sockets setup: `concurrency` pairs of sockets.
     let mut receivers = Vec::with_capacity(concurrency);
     let mut receiver_addrs = Vec::with_capacity(concurrency);
+    let mut effective_rcvbuf = 0;
+    let mut effective_sndbuf = 0;
     for _ in 0..concurrency {
         let r = Arc::new(UdpSocket::bind("127.0.0.1:0").await?);
-        configure_socket(&r);
+        let (rcv, snd) = configure_socket(&r)?;
+        effective_rcvbuf = rcv;
+        effective_sndbuf = snd;
         let addr = r.local_addr()?;
         receivers.push(r);
         receiver_addrs.push(addr);
@@ -103,7 +144,7 @@ pub async fn run_throughput_bench(
     let mut senders = Vec::with_capacity(concurrency);
     for _ in 0..concurrency {
         let s = Arc::new(UdpSocket::bind("127.0.0.1:0").await?);
-        configure_socket(&s);
+        let _ = configure_socket(&s)?;
         senders.push(s);
     }
 
@@ -461,6 +502,8 @@ pub async fn run_throughput_bench(
         peak_rss_kb,
         vol_cs,
         invol_cs,
+        effective_rcvbuf,
+        effective_sndbuf,
     })
 }
 
