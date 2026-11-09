@@ -17,6 +17,12 @@ mod linux {
         Batched(usize),
     }
 
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+    pub struct WorkerStats {
+        pub packets: u64,
+        pub io_ops: u64,
+    }
+
     #[derive(Debug, Clone)]
     pub struct BenchResult {
         pub mode: Mode,
@@ -207,12 +213,10 @@ mod linux {
                             tokio::select! {
                                 biased;
                                 _ = shutdown_rx.changed() => break,
-                                res = r.recv_from(&mut buf) => match res {
-                                    Ok(_) => {
-                                        local_packets += 1;
-                                        local_io_ops += 1;
-                                    }
-                                    Err(_) => break,
+                                res = r.recv_from(&mut buf) => {
+                                    res?;
+                                    local_packets += 1;
+                                    local_io_ops += 1;
                                 }
                             }
                         }
@@ -224,9 +228,7 @@ mod linux {
                                 biased;
                                 _ = shutdown_rx.changed() => break 'outer,
                                 res = r.readable() => {
-                                    if res.is_err() {
-                                        break 'outer;
-                                    }
+                                    res?;
                                     let mut count = 0;
                                     while count < batch_size {
                                         match r.try_recv_from(&mut buf) {
@@ -238,7 +240,7 @@ mod linux {
                                             Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
                                                 break;
                                             }
-                                            Err(_) => break 'outer,
+                                            Err(e) => return Err(e),
                                         }
                                     }
                                     tokio::task::yield_now().await;
@@ -256,19 +258,20 @@ mod linux {
                             tokio::select! {
                                 biased;
                                 _ = shutdown_rx.changed() => break,
-                                res = r.recv_many(&mut inbound) => match res {
-                                    Ok(n) => {
-                                        local_packets += n as u64;
-                                        local_io_ops += 1;
-                                        tokio::task::yield_now().await;
-                                    }
-                                    Err(_) => break,
+                                res = r.recv_many(&mut inbound) => {
+                                    let n = res?;
+                                    local_packets += n as u64;
+                                    local_io_ops += 1;
+                                    tokio::task::yield_now().await;
                                 }
                             }
                         }
                     }
                 }
-                (local_packets, local_io_ops)
+                Ok(WorkerStats {
+                    packets: local_packets,
+                    io_ops: local_io_ops,
+                })
             }));
         }
 
@@ -289,21 +292,15 @@ mod linux {
                     Mode::Baseline => {
                         let payload = vec![0x42u8; packet_size];
                         while run.load(Ordering::Relaxed) {
-                            match s.send_to(&payload, target).await {
-                                Ok(_) => {
-                                    local_packets += 1;
-                                    local_io_ops += 1;
-                                }
-                                Err(_) => break,
-                            }
+                            s.send_to(&payload, target).await?;
+                            local_packets += 1;
+                            local_io_ops += 1;
                         }
                     }
                     Mode::Grouped(batch_size) => {
                         let payload = vec![0x42u8; packet_size];
                         while run.load(Ordering::Relaxed) {
-                            if s.writable().await.is_err() {
-                                break;
-                            }
+                            s.writable().await?;
                             let mut sent = 0;
                             while sent < batch_size && run.load(Ordering::Relaxed) {
                                 match s.try_send_to(&payload, target) {
@@ -315,7 +312,7 @@ mod linux {
                                     Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
                                         break;
                                     }
-                                    Err(_) => break,
+                                    Err(e) => return Err(e),
                                 }
                             }
                             tokio::task::yield_now().await;
@@ -327,18 +324,17 @@ mod linux {
                             .map(|_| Datagram::to_addr(&payload, target))
                             .collect();
                         while run.load(Ordering::Relaxed) {
-                            match s.send_many(&batch).await {
-                                Ok(n) => {
-                                    local_packets += n as u64;
-                                    local_io_ops += 1;
-                                }
-                                Err(_) => break,
-                            }
+                            let n = s.send_many(&batch).await?;
+                            local_packets += n as u64;
+                            local_io_ops += 1;
                             tokio::task::yield_now().await;
                         }
                     }
                 }
-                (local_packets, local_io_ops)
+                Ok(WorkerStats {
+                    packets: local_packets,
+                    io_ops: local_io_ops,
+                })
             }));
         }
 
@@ -428,10 +424,30 @@ mod linux {
 
         let mut sent = 0u64;
         let mut send_io_ops = 0u64;
-        for h in send_handles {
-            if let Ok((pkts, ops)) = h.await {
-                sent += pkts;
-                send_io_ops += ops;
+        let mut worker_error = None;
+
+        for (i, h) in send_handles.into_iter().enumerate() {
+            match h.await {
+                Ok(Ok(stats)) => {
+                    sent += stats.packets;
+                    send_io_ops += stats.io_ops;
+                }
+                Ok(Err(e)) => {
+                    if worker_error.is_none() {
+                        worker_error = Some(io::Error::new(
+                            e.kind(),
+                            format!("Sender task {i} error: {e}"),
+                        ));
+                    }
+                }
+                Err(e) => {
+                    if worker_error.is_none() {
+                        worker_error = Some(io::Error::new(
+                            io::ErrorKind::Other,
+                            format!("Sender task {i} join failure: {e}"),
+                        ));
+                    }
+                }
             }
         }
 
@@ -440,10 +456,28 @@ mod linux {
 
         let mut timed_recv = 0u64;
         let mut recv_io_ops = 0u64;
-        for h in recv_handles {
-            if let Ok((pkts, ops)) = h.await {
-                timed_recv += pkts;
-                recv_io_ops += ops;
+        for (i, h) in recv_handles.into_iter().enumerate() {
+            match h.await {
+                Ok(Ok(stats)) => {
+                    timed_recv += stats.packets;
+                    recv_io_ops += stats.io_ops;
+                }
+                Ok(Err(e)) => {
+                    if worker_error.is_none() {
+                        worker_error = Some(io::Error::new(
+                            e.kind(),
+                            format!("Receiver task {i} error: {e}"),
+                        ));
+                    }
+                }
+                Err(e) => {
+                    if worker_error.is_none() {
+                        worker_error = Some(io::Error::new(
+                            io::ErrorKind::Other,
+                            format!("Receiver task {i} join failure: {e}"),
+                        ));
+                    }
+                }
             }
         }
 
@@ -453,6 +487,11 @@ mod linux {
                 _ => (Vec::new(), 0, 0),
             };
         probe_echo_h.abort();
+
+        // Invalidate run if any worker encountered an unexpected failure
+        if let Some(err) = worker_error {
+            return Err(err);
+        }
 
         // Drain any remaining buffered packets from the kernel queues
         let mut drained_recv = 0u64;
