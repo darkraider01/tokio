@@ -592,8 +592,14 @@ async fn main() -> io::Result<()> {
     println!(
         "========================================================================================="
     );
+    let test_sock = UdpSocket::bind("127.0.0.1:0").await?;
+    let (eff_rcv, eff_snd) = configure_socket(&test_sock)?;
     println!(
-        "Host: Linux x86_64, local loopback. Sockets configured with 2MB SO_RCVBUF / SO_SNDBUF."
+        "Host: Linux x86_64, local loopback. Effective socket buffers: SO_RCVBUF = {} bytes ({} KB), SO_SNDBUF = {} bytes ({} KB).",
+        eff_rcv,
+        eff_rcv / 1024,
+        eff_snd,
+        eff_snd / 1024
     );
     println!();
 
