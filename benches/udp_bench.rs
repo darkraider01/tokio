@@ -386,10 +386,16 @@ pub async fn run_throughput_bench(
                             continue;
                         } else {
                             // Unexpected future sequence
-                            return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid probe seq"));
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "invalid probe seq",
+                            ));
                         }
                     } else {
-                        return Err(io::Error::new(io::ErrorKind::InvalidData, "truncated probe reply"));
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "truncated probe reply",
+                        ));
                     }
                 }
             })
@@ -550,7 +556,9 @@ fn print_header() {
     println!(
         "| Mode | PktSz | Conc | Pkts/sec | MByte/s | CPU% (U+S) | CPU-ns/Pkt | IO-Ops/Pkt | Loss % | p50 (us) | p95 (us) | p99 (us) | Pings (TO) | Peak RSS |"
     );
-    println!("|:---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|");
+    println!(
+        "|:---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|"
+    );
 }
 
 fn print_result(r: &BenchResult) {
