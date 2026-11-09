@@ -432,13 +432,19 @@ mod linux {
         });
 
         // Synchronize workers so all tasks release simultaneously at the start of measurement
-        let rusage_start = get_rusage();
-        let start_time = Instant::now();
         start_barrier.wait().await;
+        let start_time = Instant::now();
+        let rusage_start = get_rusage();
 
         // Run measurement duration
         tokio::time::sleep(duration).await;
+        let measurement_stop_time = Instant::now();
+        let rusage_stop = get_rusage();
+        let actual_measurement_duration = measurement_stop_time.duration_since(start_time);
+
+        // Signal cooperative shutdown to both senders and receivers simultaneously
         running.store(false, Ordering::Relaxed);
+        let _ = shutdown_tx.send(true);
 
         let mut sent = 0u64;
         let mut send_io_ops = 0u64;
@@ -468,9 +474,6 @@ mod linux {
                 }
             }
         }
-
-        // Signal cooperative shutdown to all receivers so they exit without aborting
-        let _ = shutdown_tx.send(true);
 
         let mut timed_recv = 0u64;
         let mut recv_io_ops = 0u64;
@@ -511,7 +514,7 @@ mod linux {
             return Err(err);
         }
 
-        // Drain any remaining buffered packets from the kernel queues
+        // Drain any remaining buffered packets from the kernel queues post-stop
         let mut drained_recv = 0u64;
         for r in &receivers {
             let mut drain_buf = [0u8; 2048];
@@ -520,35 +523,31 @@ mod linux {
             }
         }
 
-        let elapsed = start_time.elapsed();
-        let rusage_end = get_rusage();
-
         let total_recv = timed_recv + drained_recv;
-        recv_io_ops += drained_recv;
         let total_io_ops = send_io_ops + recv_io_ops;
 
-        let utime_diff = timeval_to_duration(rusage_end.ru_utime)
+        let utime_diff = timeval_to_duration(rusage_stop.ru_utime)
             .saturating_sub(timeval_to_duration(rusage_start.ru_utime));
-        let stime_diff = timeval_to_duration(rusage_end.ru_stime)
+        let stime_diff = timeval_to_duration(rusage_stop.ru_stime)
             .saturating_sub(timeval_to_duration(rusage_start.ru_stime));
-        let elapsed_sec = elapsed.as_secs_f64();
+        let duration_sec = actual_measurement_duration.as_secs_f64();
 
-        let user_cpu_pct = (utime_diff.as_secs_f64() / elapsed_sec) * 100.0;
-        let sys_cpu_pct = (stime_diff.as_secs_f64() / elapsed_sec) * 100.0;
+        let user_cpu_pct = (utime_diff.as_secs_f64() / duration_sec) * 100.0;
+        let sys_cpu_pct = (stime_diff.as_secs_f64() / duration_sec) * 100.0;
         let total_cpu_pct = user_cpu_pct + sys_cpu_pct;
 
-        let pps = (timed_recv as f64) / elapsed_sec;
+        let pps = (timed_recv as f64) / duration_sec;
         let bytes_recv = timed_recv * (packet_size as u64);
-        let mbps = (bytes_recv as f64) / (1024.0 * 1024.0 * elapsed_sec);
+        let mbps = (bytes_recv as f64) / (1024.0 * 1024.0 * duration_sec);
 
         let total_cpu_time = utime_diff + stime_diff;
-        let cpu_ns_per_pkt = if total_recv > 0 {
-            (total_cpu_time.as_nanos() as f64) / (total_recv as f64)
+        let cpu_ns_per_pkt = if timed_recv > 0 {
+            (total_cpu_time.as_nanos() as f64) / (timed_recv as f64)
         } else {
             0.0
         };
-        let io_ops_per_pkt = if total_recv > 0 {
-            (total_io_ops as f64) / (total_recv as f64)
+        let io_ops_per_pkt = if timed_recv > 0 {
+            (total_io_ops as f64) / (timed_recv as f64)
         } else {
             0.0
         };
@@ -560,9 +559,9 @@ mod linux {
             0.0
         };
 
-        let vol_cs = rusage_end.ru_nvcsw - rusage_start.ru_nvcsw;
-        let invol_cs = rusage_end.ru_nivcsw - rusage_start.ru_nivcsw;
-        let peak_rss_kb = rusage_end.ru_maxrss;
+        let vol_cs = rusage_stop.ru_nvcsw - rusage_start.ru_nvcsw;
+        let invol_cs = rusage_stop.ru_nivcsw - rusage_start.ru_nivcsw;
+        let peak_rss_kb = rusage_stop.ru_maxrss;
 
         let (p50, p95, p99) = if !latency_samples.is_empty() {
             latency_samples.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
@@ -579,7 +578,7 @@ mod linux {
             mode,
             packet_size,
             concurrency,
-            elapsed,
+            elapsed: actual_measurement_duration,
             packets_sent: sent,
             packets_recv_timed: timed_recv,
             packets_drained: drained_recv,
