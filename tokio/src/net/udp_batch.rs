@@ -485,14 +485,14 @@ pub fn encode_sockaddr(addr: SocketAddr, storage: &mut libc::sockaddr_storage) -
             let sin6 = storage as *mut _ as *mut libc::sockaddr_in6;
             // SAFETY: `storage` is properly aligned for `sockaddr_storage` (8-byte alignment),
             // which exceeds `sockaddr_in6` (4-byte alignment). We zero the entire struct.
-            // Port is converted to network byte order (`to_be()`). Flowinfo and scope_id are passed
-            // in standard layout matching the Rust standard library representation.
+            // Port and flowinfo are converted to network byte order (`to_be()`). Scope ID is
+            // maintained in host byte order as specified by the Linux kernel ABI and RFC 3493.
             unsafe {
                 std::ptr::write_bytes(sin6, 0, 1);
                 (*sin6).sin6_family = libc::AF_INET6 as libc::sa_family_t;
                 (*sin6).sin6_port = v6.port().to_be();
                 (*sin6).sin6_addr.s6_addr = v6.ip().octets();
-                (*sin6).sin6_flowinfo = v6.flowinfo();
+                (*sin6).sin6_flowinfo = v6.flowinfo().to_be();
                 (*sin6).sin6_scope_id = v6.scope_id();
             }
             std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t
@@ -525,11 +525,13 @@ pub fn decode_sockaddr(storage: &libc::sockaddr_storage, len: libc::socklen_t) -
             let sin6 = unsafe { &*(storage as *const _ as *const libc::sockaddr_in6) };
             let ip = Ipv6Addr::from(sin6.sin6_addr.s6_addr);
             let port = u16::from_be(sin6.sin6_port);
+            let flowinfo = u32::from_be(sin6.sin6_flowinfo);
+            let scope_id = sin6.sin6_scope_id;
             Some(SocketAddr::V6(SocketAddrV6::new(
                 ip,
                 port,
-                sin6.sin6_flowinfo,
-                sin6.sin6_scope_id,
+                flowinfo,
+                scope_id,
             )))
         }
         _ => None,

@@ -625,12 +625,47 @@ async fn test_address_conversion_unit() {
         len6,
         std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t
     );
+
+    // Verify raw memory representation matches the Linux kernel ABI:
+    // sin6_port and sin6_flowinfo must be in network byte order (__be16, __be32),
+    // whereas sin6_scope_id is in host byte order (__u32).
+    let raw_sin6 = unsafe { &*(&storage as *const _ as *const libc::sockaddr_in6) };
+    assert_eq!(raw_sin6.sin6_family, libc::AF_INET6 as libc::sa_family_t);
+    assert_eq!(raw_sin6.sin6_port, 9090u16.to_be());
+    assert_eq!(raw_sin6.sin6_flowinfo, 0x12345u32.to_be());
+    assert_eq!(raw_sin6.sin6_scope_id, 42);
+
     let decoded6 = decode_sockaddr(&storage, len6).expect("IPv6 decode failed");
     assert_eq!(v6, decoded6);
     if let SocketAddr::V6(v6_dec) = decoded6 {
         assert_eq!(v6_dec.flowinfo(), 0x12345);
         assert_eq!(v6_dec.scope_id(), 42);
         assert_eq!(v6_dec.port(), 9090);
+    } else {
+        panic!("Expected IPv6 address");
+    }
+
+    // Test decoding a separately constructed raw Linux sockaddr_in6 structure
+    // with distinct byte patterns to prevent inverse bugs from hiding endian mistakes.
+    let mut manual_storage = unsafe { std::mem::zeroed::<libc::sockaddr_storage>() };
+    let manual_sin6 = &mut manual_storage as *mut _ as *mut libc::sockaddr_in6;
+    unsafe {
+        (*manual_sin6).sin6_family = libc::AF_INET6 as libc::sa_family_t;
+        (*manual_sin6).sin6_port = 7777u16.to_be();
+        (*manual_sin6).sin6_flowinfo = 0x01020304u32.to_be();
+        (*manual_sin6).sin6_scope_id = 99;
+        (*manual_sin6).sin6_addr.s6_addr = [2; 16];
+    }
+    let manual_decoded = decode_sockaddr(
+        &manual_storage,
+        std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t,
+    )
+    .expect("manual sockaddr_in6 decode failed");
+    if let SocketAddr::V6(manual_v6) = manual_decoded {
+        assert_eq!(manual_v6.port(), 7777);
+        assert_eq!(manual_v6.flowinfo(), 0x01020304);
+        assert_eq!(manual_v6.scope_id(), 99);
+        assert_eq!(*manual_v6.ip(), Ipv6Addr::from([2; 16]));
     } else {
         panic!("Expected IPv6 address");
     }
