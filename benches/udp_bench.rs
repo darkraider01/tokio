@@ -1,9 +1,10 @@
-//! Benchmark harness for evaluating standard Tokio UDP vs Batched UDP (`sendmmsg`/`recvmmsg`).
+//! Benchmark harness for evaluating standard Tokio UDP vs Grouped Nonblocking vs Batched UDP (`sendmmsg`/`recvmmsg`).
 
 #![cfg(target_os = "linux")]
 
 use std::arch::x86_64::_rdtsc;
 use std::io;
+use std::os::unix::io::AsRawFd;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -13,6 +14,7 @@ use tokio::net::UdpSocket;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
     Baseline,
+    Grouped(usize),
     Batched(usize),
 }
 
@@ -23,7 +25,9 @@ pub struct BenchResult {
     pub concurrency: usize,
     pub elapsed: Duration,
     pub packets_sent: u64,
-    pub packets_recv: u64,
+    pub packets_recv_timed: u64,
+    pub packets_drained: u64,
+    pub total_recv: u64,
     pub bytes_recv: u64,
     pub syscalls_sent: u64,
     pub syscalls_recv: u64,
@@ -43,6 +47,12 @@ pub struct BenchResult {
     pub invol_cs: i64,
 }
 
+#[derive(Default)]
+struct TaskCounters {
+    packets: AtomicU64,
+    syscalls: AtomicU64,
+}
+
 fn get_rusage() -> libc::rusage {
     unsafe {
         let mut r = std::mem::MaybeUninit::<libc::rusage>::zeroed();
@@ -55,7 +65,27 @@ fn timeval_to_duration(tv: libc::timeval) -> Duration {
     Duration::from_secs(tv.tv_sec as u64) + Duration::from_micros(tv.tv_usec as u64)
 }
 
-/// Runs a high-throughput streaming benchmark for the specified configuration.
+fn configure_socket(sock: &UdpSocket) {
+    let buf_size: libc::c_int = 2 * 1024 * 1024;
+    unsafe {
+        libc::setsockopt(
+            sock.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_RCVBUF,
+            &buf_size as *const _ as *const libc::c_void,
+            std::mem::size_of_val(&buf_size) as libc::socklen_t,
+        );
+        libc::setsockopt(
+            sock.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_SNDBUF,
+            &buf_size as *const _ as *const libc::c_void,
+            std::mem::size_of_val(&buf_size) as libc::socklen_t,
+        );
+    }
+}
+
+/// Runs a high-throughput streaming benchmark comparing Baseline, Grouped, and Batched UDP.
 pub async fn run_throughput_bench(
     mode: Mode,
     packet_size: usize,
@@ -67,6 +97,7 @@ pub async fn run_throughput_bench(
     let mut receiver_addrs = Vec::with_capacity(concurrency);
     for _ in 0..concurrency {
         let r = Arc::new(UdpSocket::bind("127.0.0.1:0").await?);
+        configure_socket(&r);
         let addr = r.local_addr()?;
         receivers.push(r);
         receiver_addrs.push(addr);
@@ -75,17 +106,21 @@ pub async fn run_throughput_bench(
     let mut senders = Vec::with_capacity(concurrency);
     for _ in 0..concurrency {
         let s = Arc::new(UdpSocket::bind("127.0.0.1:0").await?);
+        configure_socket(&s);
         senders.push(s);
     }
 
     let running = Arc::new(AtomicBool::new(true));
-    let total_sent = Arc::new(AtomicU64::new(0));
-    let total_recv = Arc::new(AtomicU64::new(0));
-    let total_send_syscalls = Arc::new(AtomicU64::new(0));
-    let total_recv_syscalls = Arc::new(AtomicU64::new(0));
 
-    // Warm-up phase (200ms)
-    // Senders and receivers run briefly to prime page tables, socket buffers, and CPU caches.
+    // Per-task counters prevent cross-task cache contention and guarantee no dropped metrics on abort.
+    let mut sender_counters = Vec::with_capacity(concurrency);
+    let mut receiver_counters = Vec::with_capacity(concurrency);
+    for _ in 0..concurrency {
+        sender_counters.push(Arc::new(TaskCounters::default()));
+        receiver_counters.push(Arc::new(TaskCounters::default()));
+    }
+
+    // Warm-up phase (100ms): prime memory, kernel tables, and CPU caches.
     let warmup_running = Arc::new(AtomicBool::new(true));
     let mut warmup_handles = Vec::new();
     for i in 0..concurrency {
@@ -96,7 +131,6 @@ pub async fn run_throughput_bench(
             let buf = vec![0xABu8; packet_size];
             while w_run.load(Ordering::Relaxed) {
                 let _ = s.send_to(&buf, target).await;
-                tokio::task::yield_now().await;
             }
         }));
         let r = receivers[i].clone();
@@ -129,46 +163,63 @@ pub async fn run_throughput_bench(
     for i in 0..concurrency {
         let r = receivers[i].clone();
         let run = running.clone();
-        let t_recv = total_recv.clone();
-        let t_sys = total_recv_syscalls.clone();
+        let counters = receiver_counters[i].clone();
 
         recv_handles.push(tokio::spawn(async move {
-            let mut local_recv = 0u64;
-            let mut local_sys = 0u64;
-
             match mode {
                 Mode::Baseline => {
                     let mut buf = vec![0u8; packet_size + 64];
                     while run.load(Ordering::Relaxed) {
                         match r.recv_from(&mut buf).await {
                             Ok(_) => {
-                                local_recv += 1;
-                                local_sys += 1;
+                                counters.packets.fetch_add(1, Ordering::Relaxed);
+                                counters.syscalls.fetch_add(1, Ordering::Relaxed);
                             }
                             Err(_) => break,
                         }
+                    }
+                }
+                Mode::Grouped(batch_size) => {
+                    let mut buf = vec![0u8; packet_size + 64];
+                    while run.load(Ordering::Relaxed) {
+                        if r.readable().await.is_err() {
+                            break;
+                        }
+                        let mut count = 0;
+                        while count < batch_size && run.load(Ordering::Relaxed) {
+                            match r.try_recv_from(&mut buf) {
+                                Ok(_) => {
+                                    count += 1;
+                                    counters.packets.fetch_add(1, Ordering::Relaxed);
+                                    counters.syscalls.fetch_add(1, Ordering::Relaxed);
+                                }
+                                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                                    break;
+                                }
+                                Err(_) => break,
+                            }
+                        }
+                        tokio::task::yield_now().await;
                     }
                 }
                 Mode::Batched(batch_size) => {
-                    let mut buffers = vec![vec![0u8; packet_size + 64]; batch_size];
+                    let mut raw_buffers = vec![vec![0u8; packet_size + 64]; batch_size];
+                    let mut inbound: Vec<InboundDatagram<'_>> = raw_buffers
+                        .iter_mut()
+                        .map(|b| InboundDatagram::new(b.as_mut_slice()))
+                        .collect();
                     while run.load(Ordering::Relaxed) {
-                        let mut inbound: Vec<InboundDatagram<'_>> = buffers
-                            .iter_mut()
-                            .map(|b| InboundDatagram::new(b.as_mut_slice()))
-                            .collect();
                         match r.recv_many(&mut inbound).await {
                             Ok(n) => {
-                                local_recv += n as u64;
-                                local_sys += 1;
+                                counters.packets.fetch_add(n as u64, Ordering::Relaxed);
+                                counters.syscalls.fetch_add(1, Ordering::Relaxed);
                             }
                             Err(_) => break,
                         }
+                        tokio::task::yield_now().await;
                     }
                 }
             }
-
-            t_recv.fetch_add(local_recv, Ordering::Relaxed);
-            t_sys.fetch_add(local_sys, Ordering::Relaxed);
         }));
     }
 
@@ -178,23 +229,41 @@ pub async fn run_throughput_bench(
         let s = senders[i].clone();
         let target = receiver_addrs[i];
         let run = running.clone();
-        let t_sent = total_sent.clone();
-        let t_sys = total_send_syscalls.clone();
+        let counters = sender_counters[i].clone();
 
         send_handles.push(tokio::spawn(async move {
-            let mut local_sent = 0u64;
-            let mut local_sys = 0u64;
-
             match mode {
                 Mode::Baseline => {
                     let payload = vec![0x42u8; packet_size];
                     while run.load(Ordering::Relaxed) {
                         match s.send_to(&payload, target).await {
                             Ok(_) => {
-                                local_sent += 1;
-                                local_sys += 1;
+                                counters.packets.fetch_add(1, Ordering::Relaxed);
+                                counters.syscalls.fetch_add(1, Ordering::Relaxed);
                             }
                             Err(_) => break,
+                        }
+                    }
+                }
+                Mode::Grouped(batch_size) => {
+                    let payload = vec![0x42u8; packet_size];
+                    while run.load(Ordering::Relaxed) {
+                        if s.writable().await.is_err() {
+                            break;
+                        }
+                        let mut sent = 0;
+                        while sent < batch_size && run.load(Ordering::Relaxed) {
+                            match s.try_send_to(&payload, target) {
+                                Ok(_) => {
+                                    sent += 1;
+                                    counters.packets.fetch_add(1, Ordering::Relaxed);
+                                    counters.syscalls.fetch_add(1, Ordering::Relaxed);
+                                }
+                                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                                    break;
+                                }
+                                Err(_) => break,
+                            }
                         }
                         tokio::task::yield_now().await;
                     }
@@ -207,8 +276,8 @@ pub async fn run_throughput_bench(
                     while run.load(Ordering::Relaxed) {
                         match s.send_many(&batch).await {
                             Ok(n) => {
-                                local_sent += n as u64;
-                                local_sys += 1;
+                                counters.packets.fetch_add(n as u64, Ordering::Relaxed);
+                                counters.syscalls.fetch_add(1, Ordering::Relaxed);
                             }
                             Err(_) => break,
                         }
@@ -216,11 +285,45 @@ pub async fn run_throughput_bench(
                     }
                 }
             }
-
-            t_sent.fetch_add(local_sent, Ordering::Relaxed);
-            t_sys.fetch_add(local_sys, Ordering::Relaxed);
         }));
     }
+
+    // Spawn concurrent latency probe under background load
+    let probe_server = Arc::new(UdpSocket::bind("127.0.0.1:0").await?);
+    let probe_addr = probe_server.local_addr()?;
+    let probe_client = Arc::new(UdpSocket::bind("127.0.0.1:0").await?);
+    let probe_run1 = running.clone();
+    let s_probe_echo = probe_server.clone();
+    let probe_echo_h = tokio::spawn(async move {
+        let mut buf = [0u8; 512];
+        while probe_run1.load(Ordering::Relaxed) {
+            if let Ok((n, src)) = s_probe_echo.recv_from(&mut buf).await {
+                let _ = s_probe_echo.send_to(&buf[..n], src).await;
+            }
+        }
+    });
+
+    let probe_run2 = running.clone();
+    let probe_h = tokio::spawn(async move {
+        let mut samples = Vec::with_capacity(300);
+        let mut buf = [0u8; 512];
+        let ping_payload = [0x5Au8; 64];
+
+        while probe_run2.load(Ordering::Relaxed) {
+            let t0 = Instant::now();
+            let ping = tokio::time::timeout(Duration::from_millis(25), async {
+                probe_client.send_to(&ping_payload, probe_addr).await?;
+                probe_client.recv_from(&mut buf).await?;
+                Ok::<(), io::Error>(())
+            });
+
+            if let Ok(Ok(())) = ping.await {
+                samples.push(t0.elapsed().as_secs_f64() * 1_000_000.0);
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        samples
+    });
 
     // Run measurement duration
     tokio::time::sleep(duration).await;
@@ -229,16 +332,30 @@ pub async fn run_throughput_bench(
     for h in send_handles {
         let _ = h.await;
     }
-    // Give receivers a moment to receive in-flight packets, then abort
-    tokio::time::sleep(Duration::from_millis(15)).await;
+
+    // Snapshot timed packets received immediately when senders complete
+    let timed_recv: u64 = receiver_counters
+        .iter()
+        .map(|c| c.packets.load(Ordering::Relaxed))
+        .sum();
+
+    // Give receivers a 20ms grace window for in-flight datagrams, then abort
+    tokio::time::sleep(Duration::from_millis(20)).await;
     for h in recv_handles {
         h.abort();
     }
-    // Drain any remaining buffered packets
+    probe_echo_h.abort();
+    let mut latency_samples = match tokio::time::timeout(Duration::from_millis(50), probe_h).await {
+        Ok(Ok(samples)) => samples,
+        _ => Vec::new(),
+    };
+
+    // Drain any remaining buffered packets from the kernel queues
+    let mut drained_recv = 0u64;
     for r in &receivers {
         let mut drain_buf = [0u8; 2048];
         while r.try_recv_from(&mut drain_buf).is_ok() {
-            total_recv.fetch_add(1, Ordering::Relaxed);
+            drained_recv += 1;
         }
     }
 
@@ -246,10 +363,25 @@ pub async fn run_throughput_bench(
     let tsc_end = unsafe { _rdtsc() };
     let rusage_end = get_rusage();
 
-    let sent = total_sent.load(Ordering::Relaxed);
-    let recv = total_recv.load(Ordering::Relaxed);
-    let send_syscalls = total_send_syscalls.load(Ordering::Relaxed);
-    let recv_syscalls = total_recv_syscalls.load(Ordering::Relaxed);
+    let sent: u64 = sender_counters
+        .iter()
+        .map(|c| c.packets.load(Ordering::Relaxed))
+        .sum();
+    let recv_after_grace: u64 = receiver_counters
+        .iter()
+        .map(|c| c.packets.load(Ordering::Relaxed))
+        .sum();
+    let total_recv = recv_after_grace + drained_recv;
+
+    let send_syscalls: u64 = sender_counters
+        .iter()
+        .map(|c| c.syscalls.load(Ordering::Relaxed))
+        .sum();
+    let recv_syscalls: u64 = receiver_counters
+        .iter()
+        .map(|c| c.syscalls.load(Ordering::Relaxed))
+        .sum::<u64>()
+        + drained_recv;
     let total_syscalls = send_syscalls + recv_syscalls;
 
     let utime_diff = timeval_to_duration(rusage_end.ru_utime)
@@ -262,24 +394,24 @@ pub async fn run_throughput_bench(
     let sys_cpu_pct = (stime_diff.as_secs_f64() / elapsed_sec) * 100.0;
     let total_cpu_pct = user_cpu_pct + sys_cpu_pct;
 
-    let pps = (recv as f64) / elapsed_sec;
-    let bytes_recv = recv * (packet_size as u64);
-    let mbps = (bytes_recv as f64) / (1024.0 * 1024.0 * elapsed_sec);
+    let pps = (timed_recv as f64) / duration.as_secs_f64();
+    let bytes_recv = timed_recv * (packet_size as u64);
+    let mbps = (bytes_recv as f64) / (1024.0 * 1024.0 * duration.as_secs_f64());
 
     let total_cycles = tsc_end.saturating_sub(tsc_start);
-    let cycles_per_pkt = if recv > 0 {
-        (total_cycles as f64) / (recv as f64)
+    let cycles_per_pkt = if total_recv > 0 {
+        (total_cycles as f64) / (total_recv as f64)
     } else {
         0.0
     };
-    let syscalls_per_pkt = if recv > 0 {
-        (total_syscalls as f64) / (recv as f64)
+    let syscalls_per_pkt = if total_recv > 0 {
+        (total_syscalls as f64) / (total_recv as f64)
     } else {
         0.0
     };
 
     let packet_loss_pct = if sent > 0 {
-        let lost = sent.saturating_sub(recv);
+        let lost = sent.saturating_sub(total_recv);
         (lost as f64) / (sent as f64) * 100.0
     } else {
         0.0
@@ -289,8 +421,16 @@ pub async fn run_throughput_bench(
     let invol_cs = rusage_end.ru_nivcsw - rusage_start.ru_nivcsw;
     let peak_rss_kb = rusage_end.ru_maxrss;
 
-    // Measure RTT latency percentiles using an isolated ping-pong sample
-    let (p50, p95, p99) = measure_latency(mode, packet_size).await?;
+    let (p50, p95, p99) = if !latency_samples.is_empty() {
+        latency_samples.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        (
+            latency_samples[latency_samples.len() * 50 / 100],
+            latency_samples[latency_samples.len() * 95 / 100],
+            latency_samples[latency_samples.len() * 99 / 100],
+        )
+    } else {
+        (0.0, 0.0, 0.0)
+    };
 
     Ok(BenchResult {
         mode,
@@ -298,7 +438,9 @@ pub async fn run_throughput_bench(
         concurrency,
         elapsed,
         packets_sent: sent,
-        packets_recv: recv,
+        packets_recv_timed: timed_recv,
+        packets_drained: drained_recv,
+        total_recv,
         bytes_recv,
         syscalls_sent: send_syscalls,
         syscalls_recv: recv_syscalls,
@@ -319,100 +461,17 @@ pub async fn run_throughput_bench(
     })
 }
 
-/// Measures round-trip time (RTT) latency percentiles for the configuration.
-async fn measure_latency(mode: Mode, packet_size: usize) -> io::Result<(f64, f64, f64)> {
-    let server = Arc::new(UdpSocket::bind("127.0.0.1:0").await?);
-    let server_addr = server.local_addr()?;
-    let client = Arc::new(UdpSocket::bind("127.0.0.1:0").await?);
-
-    let stop_echo = Arc::new(AtomicBool::new(false));
-    let stop_echo_clone = stop_echo.clone();
-
-    // Spawn server echo loop
-    let s_clone = server.clone();
-    let echo_handle = tokio::spawn(async move {
-        match mode {
-            Mode::Baseline => {
-                let mut buf = vec![0u8; packet_size + 64];
-                while !stop_echo_clone.load(Ordering::Relaxed) {
-                    if let Ok((len, src)) = s_clone.recv_from(&mut buf).await {
-                        let _ = s_clone.send_to(&buf[..len], src).await;
-                    }
-                }
-            }
-            Mode::Batched(batch_size) => {
-                let mut buffers = vec![vec![0u8; packet_size + 64]; batch_size];
-                while !stop_echo_clone.load(Ordering::Relaxed) {
-                    let mut inbound: Vec<InboundDatagram<'_>> = buffers
-                        .iter_mut()
-                        .map(|b| InboundDatagram::new(b.as_mut_slice()))
-                        .collect();
-                    if let Ok(n) = s_clone.recv_many(&mut inbound).await {
-                        let outbound: Vec<Datagram<'_>> = inbound[..n]
-                            .iter()
-                            .filter_map(|d| d.source.map(|addr| Datagram::to_addr(d.payload(), addr)))
-                            .collect();
-                        let _ = s_clone.send_many(&outbound).await;
-                    }
-                }
-            }
-        }
-    });
-
-    let mut samples = Vec::with_capacity(300);
-    let payload = vec![0x7Eu8; packet_size];
-    let mut recv_buf = vec![0u8; packet_size + 64];
-
-    // Measure 200 pings with timeout per ping
-    for _ in 0..200 {
-        let t0 = Instant::now();
-        let ping_res = tokio::time::timeout(Duration::from_millis(50), async {
-            match mode {
-                Mode::Baseline => {
-                    client.send_to(&payload, server_addr).await?;
-                    let _ = client.recv_from(&mut recv_buf).await?;
-                }
-                Mode::Batched(_) => {
-                    client.send_many(&[Datagram::to_addr(&payload, server_addr)]).await?;
-                    let mut inbound = [InboundDatagram::new(&mut recv_buf)];
-                    let _ = client.recv_many(&mut inbound).await?;
-                }
-            }
-            Ok::<(), io::Error>(())
-        })
-        .await;
-
-        if ping_res.is_ok() {
-            let rtt = t0.elapsed();
-            samples.push(rtt.as_secs_f64() * 1_000_000.0);
-        }
-    }
-
-    echo_handle.abort();
-
-    if samples.is_empty() {
-        return Ok((0.0, 0.0, 0.0));
-    }
-    samples.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let p50 = samples[samples.len() * 50 / 100];
-    let p95 = samples[samples.len() * 95 / 100];
-    let p99 = samples[samples.len() * 99 / 100];
-
-    Ok((p50, p95, p99))
-}
-
 fn print_header() {
     println!(
         "| Mode | PktSz | Conc | Pkts/sec | MByte/s | CPU% (U+S) | Cycles/Pkt | Syscalls/Pkt | Loss % | p50 (us) | p95 (us) | p99 (us) | Peak RSS |"
     );
-    println!(
-        "|:---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|"
-    );
+    println!("|:---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|");
 }
 
 fn print_result(r: &BenchResult) {
     let mode_str = match r.mode {
         Mode::Baseline => "Baseline".to_string(),
+        Mode::Grouped(b) => format!("Group-{}", b),
         Mode::Batched(b) => format!("Batch-{}", b),
     };
     println!(
@@ -437,19 +496,27 @@ fn print_result(r: &BenchResult) {
 
 #[tokio::main]
 async fn main() -> io::Result<()> {
-    println!("=========================================================================================");
-    println!("             TOKIO UDP BENCHMARK: BASELINE vs NATIVE LINUX BATCHED I/O                  ");
-    println!("=========================================================================================");
-    println!("Host: Linux 6.19 x86_64, 12 cores. Local loopback interface.");
+    println!(
+        "========================================================================================="
+    );
+    println!(
+        "        TOKIO UDP BENCHMARK: BASELINE vs GROUPED NONBLOCKING vs NATIVE LINUX BATCH       "
+    );
+    println!(
+        "========================================================================================="
+    );
+    println!(
+        "Host: Linux x86_64, local loopback. Sockets configured with 2MB SO_RCVBUF / SO_SNDBUF."
+    );
     println!();
 
     let packet_sizes = [64, 512, 1200, 1472];
     let concurrencies = [1, 4, 16, 64];
-    let batch_sizes = [1, 4, 8, 16, 32, 64];
-    let duration = Duration::from_millis(600);
+    let batch_sizes = [4, 8, 16, 32, 64];
+    let duration = Duration::from_millis(400);
 
     // Section 1: Baseline Tokio across all Packet Sizes and Concurrencies
-    println!("### PART 1: Baseline Tokio UDP Operations");
+    println!("### PART 1: Baseline Tokio UDP Operations (Single-Packet async send_to/recv_from)");
     print_header();
     for &pkt in &packet_sizes {
         for &conc in &concurrencies {
@@ -459,45 +526,57 @@ async fn main() -> io::Result<()> {
     }
     println!();
 
-    // Section 2: Batch Size Evaluation (64-byte packets, 16x16 concurrency)
-    println!("### PART 2: Batch Size Sweep (Packet Size: 64B, Concurrency: 16x16)");
+    // Section 2: Three-Way Comparison: Baseline vs Grouped vs Batched (64B packets, 16x16 concurrency)
+    println!("### PART 2: Three-Way Comparison (Packet Size: 64B, Concurrency: 16x16)");
     print_header();
     let b_res = run_throughput_bench(Mode::Baseline, 64, 16, duration).await?;
     print_result(&b_res);
     for &bs in &batch_sizes {
+        let g_res = run_throughput_bench(Mode::Grouped(bs), 64, 16, duration).await?;
+        print_result(&g_res);
         let res = run_throughput_bench(Mode::Batched(bs), 64, 16, duration).await?;
         print_result(&res);
     }
     println!();
 
-    // Section 3: Batch Size Evaluation (1472-byte packets, 16x16 concurrency)
-    println!("### PART 3: Batch Size Sweep (Packet Size: 1472B, Concurrency: 16x16)");
+    // Section 3: Three-Way Comparison: Baseline vs Grouped vs Batched (1472B packets, 16x16 concurrency)
+    println!("### PART 3: Three-Way Comparison (Packet Size: 1472B, Concurrency: 16x16)");
     print_header();
     let b_res1472 = run_throughput_bench(Mode::Baseline, 1472, 16, duration).await?;
     print_result(&b_res1472);
     for &bs in &batch_sizes {
+        let g_res = run_throughput_bench(Mode::Grouped(bs), 1472, 16, duration).await?;
+        print_result(&g_res);
         let res = run_throughput_bench(Mode::Batched(bs), 1472, 16, duration).await?;
         print_result(&res);
     }
     println!();
 
-    // Section 4: Concurrency Scaling with Batch-32 (64-byte packets)
-    println!("### PART 4: Concurrency Scaling (Packet Size: 64B, Batch: 32 vs Baseline)");
+    // Section 4: Concurrency Scaling (Packet Size: 64B): Baseline vs Group-32 vs Batch-32
+    println!(
+        "### PART 4: Concurrency Scaling (Packet Size: 64B: Baseline vs Group-32 vs Batch-32)"
+    );
     print_header();
     for &conc in &concurrencies {
         let b = run_throughput_bench(Mode::Baseline, 64, conc, duration).await?;
         print_result(&b);
+        let g = run_throughput_bench(Mode::Grouped(32), 64, conc, duration).await?;
+        print_result(&g);
         let batched = run_throughput_bench(Mode::Batched(32), 64, conc, duration).await?;
         print_result(&batched);
     }
     println!();
 
-    // Section 5: Concurrency Scaling with Batch-32 (1472-byte packets)
-    println!("### PART 5: Concurrency Scaling (Packet Size: 1472B, Batch: 32 vs Baseline)");
+    // Section 5: Concurrency Scaling (Packet Size: 1472B): Baseline vs Group-32 vs Batch-32
+    println!(
+        "### PART 5: Concurrency Scaling (Packet Size: 1472B: Baseline vs Group-32 vs Batch-32)"
+    );
     print_header();
     for &conc in &concurrencies {
         let b = run_throughput_bench(Mode::Baseline, 1472, conc, duration).await?;
         print_result(&b);
+        let g = run_throughput_bench(Mode::Grouped(32), 1472, conc, duration).await?;
+        print_result(&g);
         let batched = run_throughput_bench(Mode::Batched(32), 1472, conc, duration).await?;
         print_result(&batched);
     }
