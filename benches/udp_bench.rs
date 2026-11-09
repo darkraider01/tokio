@@ -29,15 +29,18 @@ pub struct BenchResult {
     pub packets_drained: u64,
     pub total_recv: u64,
     pub bytes_recv: u64,
-    pub syscalls_sent: u64,
-    pub syscalls_recv: u64,
+    /// Number of successful socket I/O operations (sendto or sendmmsg calls).
+    pub successful_io_sends: u64,
+    /// Number of successful socket I/O operations (recvfrom or recvmmsg calls).
+    pub successful_io_recvs: u64,
     pub pps: f64,
     pub mbps: f64,
     pub user_cpu_pct: f64,
     pub sys_cpu_pct: f64,
     pub total_cpu_pct: f64,
     pub cycles_per_pkt: f64,
-    pub syscalls_per_pkt: f64,
+    /// Proxy metric for system call efficiency: successful socket operations per delivered packet.
+    pub io_ops_per_pkt: f64,
     pub packet_loss_pct: f64,
     pub p50_rtt_us: f64,
     pub p95_rtt_us: f64,
@@ -151,7 +154,7 @@ pub async fn run_throughput_bench(
         recv_handles.push(tokio::spawn(async move {
             barrier.wait().await;
             let mut local_packets = 0u64;
-            let mut local_syscalls = 0u64;
+            let mut local_io_ops = 0u64;
 
             match mode {
                 Mode::Baseline => {
@@ -163,7 +166,7 @@ pub async fn run_throughput_bench(
                             res = r.recv_from(&mut buf) => match res {
                                 Ok(_) => {
                                     local_packets += 1;
-                                    local_syscalls += 1;
+                                    local_io_ops += 1;
                                 }
                                 Err(_) => break,
                             }
@@ -186,7 +189,7 @@ pub async fn run_throughput_bench(
                                         Ok(_) => {
                                             count += 1;
                                             local_packets += 1;
-                                            local_syscalls += 1;
+                                            local_io_ops += 1;
                                         }
                                         Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
                                             break;
@@ -212,7 +215,7 @@ pub async fn run_throughput_bench(
                             res = r.recv_many(&mut inbound) => match res {
                                 Ok(n) => {
                                     local_packets += n as u64;
-                                    local_syscalls += 1;
+                                    local_io_ops += 1;
                                     tokio::task::yield_now().await;
                                 }
                                 Err(_) => break,
@@ -221,7 +224,7 @@ pub async fn run_throughput_bench(
                     }
                 }
             }
-            (local_packets, local_syscalls)
+            (local_packets, local_io_ops)
         }));
     }
 
@@ -236,7 +239,7 @@ pub async fn run_throughput_bench(
         send_handles.push(tokio::spawn(async move {
             barrier.wait().await;
             let mut local_packets = 0u64;
-            let mut local_syscalls = 0u64;
+            let mut local_io_ops = 0u64;
 
             match mode {
                 Mode::Baseline => {
@@ -245,7 +248,7 @@ pub async fn run_throughput_bench(
                         match s.send_to(&payload, target).await {
                             Ok(_) => {
                                 local_packets += 1;
-                                local_syscalls += 1;
+                                local_io_ops += 1;
                             }
                             Err(_) => break,
                         }
@@ -263,7 +266,7 @@ pub async fn run_throughput_bench(
                                 Ok(_) => {
                                     sent += 1;
                                     local_packets += 1;
-                                    local_syscalls += 1;
+                                    local_io_ops += 1;
                                 }
                                 Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
                                     break;
@@ -283,7 +286,7 @@ pub async fn run_throughput_bench(
                         match s.send_many(&batch).await {
                             Ok(n) => {
                                 local_packets += n as u64;
-                                local_syscalls += 1;
+                                local_io_ops += 1;
                             }
                             Err(_) => break,
                         }
@@ -291,7 +294,7 @@ pub async fn run_throughput_bench(
                     }
                 }
             }
-            (local_packets, local_syscalls)
+            (local_packets, local_io_ops)
         }));
     }
 
@@ -343,11 +346,11 @@ pub async fn run_throughput_bench(
     running.store(false, Ordering::Relaxed);
 
     let mut sent = 0u64;
-    let mut send_syscalls = 0u64;
+    let mut send_io_ops = 0u64;
     for h in send_handles {
-        if let Ok((pkts, sys)) = h.await {
+        if let Ok((pkts, ops)) = h.await {
             sent += pkts;
-            send_syscalls += sys;
+            send_io_ops += ops;
         }
     }
 
@@ -355,11 +358,11 @@ pub async fn run_throughput_bench(
     let _ = shutdown_tx.send(true);
 
     let mut timed_recv = 0u64;
-    let mut recv_syscalls = 0u64;
+    let mut recv_io_ops = 0u64;
     for h in recv_handles {
-        if let Ok((pkts, sys)) = h.await {
+        if let Ok((pkts, ops)) = h.await {
             timed_recv += pkts;
-            recv_syscalls += sys;
+            recv_io_ops += ops;
         }
     }
 
@@ -383,8 +386,8 @@ pub async fn run_throughput_bench(
     let rusage_end = get_rusage();
 
     let total_recv = timed_recv + drained_recv;
-    recv_syscalls += drained_recv;
-    let total_syscalls = send_syscalls + recv_syscalls;
+    recv_io_ops += drained_recv;
+    let total_io_ops = send_io_ops + recv_io_ops;
 
     let utime_diff = timeval_to_duration(rusage_end.ru_utime)
         .saturating_sub(timeval_to_duration(rusage_start.ru_utime));
@@ -406,8 +409,8 @@ pub async fn run_throughput_bench(
     } else {
         0.0
     };
-    let syscalls_per_pkt = if total_recv > 0 {
-        (total_syscalls as f64) / (total_recv as f64)
+    let io_ops_per_pkt = if total_recv > 0 {
+        (total_io_ops as f64) / (total_recv as f64)
     } else {
         0.0
     };
@@ -444,15 +447,15 @@ pub async fn run_throughput_bench(
         packets_drained: drained_recv,
         total_recv,
         bytes_recv,
-        syscalls_sent: send_syscalls,
-        syscalls_recv: recv_syscalls,
+        successful_io_sends: send_io_ops,
+        successful_io_recvs: recv_io_ops,
         pps,
         mbps,
         user_cpu_pct,
         sys_cpu_pct,
         total_cpu_pct,
         cycles_per_pkt,
-        syscalls_per_pkt,
+        io_ops_per_pkt,
         packet_loss_pct,
         p50_rtt_us: p50,
         p95_rtt_us: p95,
@@ -465,7 +468,7 @@ pub async fn run_throughput_bench(
 
 fn print_header() {
     println!(
-        "| Mode | PktSz | Conc | Pkts/sec | MByte/s | CPU% (U+S) | Cycles/Pkt | Syscalls/Pkt | Loss % | p50 (us) | p95 (us) | p99 (us) | Peak RSS |"
+        "| Mode | PktSz | Conc | Pkts/sec | MByte/s | CPU% (U+S) | Cycles/Pkt | IO-Ops/Pkt | Loss % | p50 (us) | p95 (us) | p99 (us) | Peak RSS |"
     );
     println!("|:---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|");
 }
@@ -487,7 +490,7 @@ fn print_result(r: &BenchResult) {
         r.user_cpu_pct,
         r.sys_cpu_pct,
         r.cycles_per_pkt,
-        r.syscalls_per_pkt,
+        r.io_ops_per_pkt,
         r.packet_loss_pct,
         r.p50_rtt_us,
         r.p95_rtt_us,
