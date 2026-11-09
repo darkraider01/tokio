@@ -100,10 +100,12 @@ mod linux {
     }
 
     #[derive(Debug, Clone)]
-    pub struct BenchResult {
+    pub struct TrialResult {
+        pub trial_index: usize,
         pub mode: Mode,
         pub packet_size: usize,
         pub concurrency: usize,
+        pub batch_size: usize,
         /// Configured nominal measurement duration.
         pub nominal_duration: Duration,
         /// Actual elapsed duration from start barrier release until all workers have stopped and joined.
@@ -140,9 +142,9 @@ mod linux {
         pub effective_sndbuf: usize,
     }
 
-    impl BenchResult {
+    impl TrialResult {
         pub fn csv_header() -> &'static str {
-            "mode,packet_size,concurrency,nominal_duration_ms,elapsed_ms,packets_sent,packets_recv_timed,packets_drained,total_recv,bytes_recv,pps,mib_per_sec,cpu_user_pct,cpu_sys_pct,cpu_total_pct,cpu_ns_per_pkt,io_ops_per_pkt,packet_loss_pct,p50_rtt_us,p95_rtt_us,p99_rtt_us,latency_samples,latency_timeouts,latency_invalid,peak_rss_kb\n"
+            "trial_index,mode,packet_size,concurrency,batch_size,nominal_duration_ms,elapsed_ms,packets_sent,packets_recv_timed,packets_drained,total_recv,bytes_recv,pps,mib_per_sec,cpu_user_pct,cpu_sys_pct,cpu_total_pct,cpu_ns_per_pkt,io_ops_per_pkt,packet_loss_pct,p50_rtt_us,p95_rtt_us,p99_rtt_us,latency_samples,latency_timeouts,latency_invalid,peak_rss_kb\n"
         }
 
         pub fn to_csv_row(&self) -> String {
@@ -152,10 +154,12 @@ mod linux {
                 Mode::Batched(b) => format!("batched_{b}"),
             };
             format!(
-                "{},{},{},{:.3},{:.3},{},{},{},{},{},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{},{},{},{},{},{},{}\n",
+                "{},{},{},{},{},{:.3},{:.3},{},{},{},{},{},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{},{},{},{},{},{},{}\n",
+                self.trial_index,
                 mode_str,
                 self.packet_size,
                 self.concurrency,
+                self.batch_size,
                 self.nominal_duration.as_secs_f64() * 1000.0,
                 self.elapsed.as_secs_f64() * 1000.0,
                 self.packets_sent,
@@ -188,10 +192,12 @@ mod linux {
                 Mode::Batched(b) => &format!("batched_{b}"),
             };
             format!(
-                "{{\"mode\":\"{}\",\"packet_size\":{},\"concurrency\":{},\"nominal_duration_ms\":{:.3},\"elapsed_ms\":{:.3},\"packets_sent\":{},\"packets_recv_timed\":{},\"packets_drained\":{},\"total_recv\":{},\"bytes_recv\":{},\"pps\":{:.2},\"mib_per_sec\":{:.2},\"cpu_user_pct\":{:.2},\"cpu_sys_pct\":{:.2},\"cpu_total_pct\":{:.2},\"cpu_ns_per_pkt\":{:.2},\"io_ops_per_pkt\":{:.2},\"packet_loss_pct\":{:.2},\"p50_rtt_us\":{},\"p95_rtt_us\":{},\"p99_rtt_us\":{},\"latency_samples\":{},\"latency_timeouts\":{},\"latency_invalid\":{},\"peak_rss_kb\":{}}}",
+                "{{\"trial_index\":{},\"mode\":\"{}\",\"packet_size\":{},\"concurrency\":{},\"batch_size\":{},\"nominal_duration_ms\":{:.3},\"elapsed_ms\":{:.3},\"packets_sent\":{},\"packets_recv_timed\":{},\"packets_drained\":{},\"total_recv\":{},\"bytes_recv\":{},\"pps\":{:.2},\"mib_per_sec\":{:.2},\"cpu_user_pct\":{:.2},\"cpu_sys_pct\":{:.2},\"cpu_total_pct\":{:.2},\"cpu_ns_per_pkt\":{:.2},\"io_ops_per_pkt\":{:.2},\"packet_loss_pct\":{:.2},\"p50_rtt_us\":{},\"p95_rtt_us\":{},\"p99_rtt_us\":{},\"latency_samples\":{},\"latency_timeouts\":{},\"latency_invalid\":{},\"peak_rss_kb\":{}}}",
+                self.trial_index,
                 mode_str,
                 self.packet_size,
                 self.concurrency,
+                self.batch_size,
                 self.nominal_duration.as_secs_f64() * 1000.0,
                 self.elapsed.as_secs_f64() * 1000.0,
                 self.packets_sent,
@@ -214,6 +220,168 @@ mod linux {
                 self.latency_timeouts,
                 self.latency_invalid,
                 self.peak_rss_kb,
+            )
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    pub struct BenchSummary {
+        pub mode: Mode,
+        pub packet_size: usize,
+        pub concurrency: usize,
+        pub trials: usize,
+        pub median_pps: f64,
+        pub mean_pps: f64,
+        pub stddev_pps: f64,
+        pub min_pps: f64,
+        pub max_pps: f64,
+        pub median_mib_per_sec: f64,
+        pub mean_mib_per_sec: f64,
+        pub median_cpu_pct: f64,
+        pub mean_cpu_pct: f64,
+        pub median_cpu_ns_per_pkt: f64,
+        pub mean_cpu_ns_per_pkt: f64,
+        pub median_io_ops_per_pkt: f64,
+        pub mean_io_ops_per_pkt: f64,
+        pub median_loss_pct: f64,
+        pub mean_loss_pct: f64,
+        pub median_p50_rtt_us: Option<f64>,
+        pub median_p95_rtt_us: Option<f64>,
+        pub median_p99_rtt_us: Option<f64>,
+        pub representative: TrialResult,
+        pub raw_trials: Vec<TrialResult>,
+    }
+
+    impl BenchSummary {
+        pub fn from_trials(trials: Vec<TrialResult>) -> Self {
+            assert!(!trials.is_empty(), "trials must not be empty");
+            let n = trials.len();
+            let mode = trials[0].mode;
+            let packet_size = trials[0].packet_size;
+            let concurrency = trials[0].concurrency;
+
+            let mut sorted_by_pps = trials.clone();
+            sorted_by_pps.sort_by(|a, b| {
+                a.pps
+                    .partial_cmp(&b.pps)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+
+            let median_pps = if n % 2 == 1 {
+                sorted_by_pps[n / 2].pps
+            } else {
+                (sorted_by_pps[n / 2 - 1].pps + sorted_by_pps[n / 2].pps) / 2.0
+            };
+            let min_pps = sorted_by_pps[0].pps;
+            let max_pps = sorted_by_pps[n - 1].pps;
+
+            let sum_pps: f64 = trials.iter().map(|t| t.pps).sum();
+            let mean_pps = sum_pps / (n as f64);
+            let var_pps: f64 = trials
+                .iter()
+                .map(|t| (t.pps - mean_pps).powi(2))
+                .sum::<f64>()
+                / (n as f64);
+            let stddev_pps = var_pps.sqrt();
+
+            let mut sorted_mib: Vec<f64> = trials.iter().map(|t| t.mib_per_sec).collect();
+            sorted_mib.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            let median_mib_per_sec = sorted_mib[n / 2];
+            let mean_mib_per_sec = trials.iter().map(|t| t.mib_per_sec).sum::<f64>() / (n as f64);
+
+            let mut sorted_cpu: Vec<f64> = trials.iter().map(|t| t.total_cpu_pct).collect();
+            sorted_cpu.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            let median_cpu_pct = sorted_cpu[n / 2];
+            let mean_cpu_pct = trials.iter().map(|t| t.total_cpu_pct).sum::<f64>() / (n as f64);
+
+            let mut sorted_cpu_ns: Vec<f64> = trials.iter().map(|t| t.cpu_ns_per_pkt).collect();
+            sorted_cpu_ns.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            let median_cpu_ns_per_pkt = sorted_cpu_ns[n / 2];
+            let mean_cpu_ns_per_pkt =
+                trials.iter().map(|t| t.cpu_ns_per_pkt).sum::<f64>() / (n as f64);
+
+            let mut sorted_io_ops: Vec<f64> = trials.iter().map(|t| t.io_ops_per_pkt).collect();
+            sorted_io_ops.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            let median_io_ops_per_pkt = sorted_io_ops[n / 2];
+            let mean_io_ops_per_pkt =
+                trials.iter().map(|t| t.io_ops_per_pkt).sum::<f64>() / (n as f64);
+
+            let mut sorted_loss: Vec<f64> = trials.iter().map(|t| t.packet_loss_pct).collect();
+            sorted_loss.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            let median_loss_pct = sorted_loss[n / 2];
+            let mean_loss_pct = trials.iter().map(|t| t.packet_loss_pct).sum::<f64>() / (n as f64);
+
+            let calc_median_opt = |extract: fn(&TrialResult) -> Option<f64>| -> Option<f64> {
+                let mut vals: Vec<f64> = trials.iter().filter_map(extract).collect();
+                if vals.is_empty() {
+                    None
+                } else {
+                    vals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                    Some(vals[vals.len() / 2])
+                }
+            };
+
+            let median_p50_rtt_us = calc_median_opt(|t| t.p50_rtt_us);
+            let median_p95_rtt_us = calc_median_opt(|t| t.p95_rtt_us);
+            let median_p99_rtt_us = calc_median_opt(|t| t.p99_rtt_us);
+
+            let representative = sorted_by_pps[n / 2].clone();
+
+            Self {
+                mode,
+                packet_size,
+                concurrency,
+                trials: n,
+                median_pps,
+                mean_pps,
+                stddev_pps,
+                min_pps,
+                max_pps,
+                median_mib_per_sec,
+                mean_mib_per_sec,
+                median_cpu_pct,
+                mean_cpu_pct,
+                median_cpu_ns_per_pkt,
+                mean_cpu_ns_per_pkt,
+                median_io_ops_per_pkt,
+                mean_io_ops_per_pkt,
+                median_loss_pct,
+                mean_loss_pct,
+                median_p50_rtt_us,
+                median_p95_rtt_us,
+                median_p99_rtt_us,
+                representative,
+                raw_trials: trials,
+            }
+        }
+
+        pub fn to_json(&self) -> String {
+            let mode_str = match self.mode {
+                Mode::Baseline => "baseline",
+                Mode::Grouped(b) => &format!("grouped_{b}"),
+                Mode::Batched(b) => &format!("batched_{b}"),
+            };
+            let trials_json: Vec<String> = self.raw_trials.iter().map(|t| t.to_json()).collect();
+            format!(
+                "{{\"mode\":\"{}\",\"packet_size\":{},\"concurrency\":{},\"trials\":{},\"median_pps\":{:.2},\"mean_pps\":{:.2},\"stddev_pps\":{:.2},\"min_pps\":{:.2},\"max_pps\":{:.2},\"median_mib_per_sec\":{:.2},\"median_cpu_pct\":{:.2},\"median_cpu_ns_per_pkt\":{:.2},\"median_io_ops_per_pkt\":{:.2},\"median_loss_pct\":{:.2},\"median_p50_rtt_us\":{},\"median_p95_rtt_us\":{},\"median_p99_rtt_us\":{},\"raw_trials\":[\n    {}\n  ]}}",
+                mode_str,
+                self.packet_size,
+                self.concurrency,
+                self.trials,
+                self.median_pps,
+                self.mean_pps,
+                self.stddev_pps,
+                self.min_pps,
+                self.max_pps,
+                self.median_mib_per_sec,
+                self.median_cpu_pct,
+                self.median_cpu_ns_per_pkt,
+                self.median_io_ops_per_pkt,
+                self.median_loss_pct,
+                self.median_p50_rtt_us.map(|v| format!("{v:.2}")).unwrap_or_else(|| "null".to_string()),
+                self.median_p95_rtt_us.map(|v| format!("{v:.2}")).unwrap_or_else(|| "null".to_string()),
+                self.median_p99_rtt_us.map(|v| format!("{v:.2}")).unwrap_or_else(|| "null".to_string()),
+                trials_json.join(",\n    ")
             )
         }
     }
@@ -293,8 +461,9 @@ mod linux {
         mode: Mode,
         packet_size: usize,
         concurrency: usize,
+        trial_index: usize,
         config: &BenchConfig,
-    ) -> io::Result<BenchResult> {
+    ) -> io::Result<TrialResult> {
         // Sockets setup: `concurrency` pairs of sockets.
         let mut receivers = Vec::with_capacity(concurrency);
         let mut receiver_addrs = Vec::with_capacity(concurrency);
@@ -766,10 +935,17 @@ mod linux {
             (None, None, None)
         };
 
-        Ok(BenchResult {
+        let batch_size = match mode {
+            Mode::Baseline => 1,
+            Mode::Grouped(b) | Mode::Batched(b) => b,
+        };
+
+        Ok(TrialResult {
+            trial_index,
             mode,
             packet_size,
             concurrency,
+            batch_size,
             nominal_duration,
             elapsed: actual_measurement_duration,
             packets_sent: sent,
@@ -806,23 +982,17 @@ mod linux {
         packet_size: usize,
         concurrency: usize,
         config: &BenchConfig,
-    ) -> io::Result<BenchResult> {
-        if config.trials <= 1 {
-            return run_throughput_bench(mode, packet_size, concurrency, config).await;
+    ) -> io::Result<BenchSummary> {
+        let mut trials = Vec::with_capacity(config.trials);
+        for trial_index in 0..config.trials {
+            let res =
+                run_throughput_bench(mode, packet_size, concurrency, trial_index, config).await?;
+            trials.push(res);
+            if config.trials > 1 && trial_index + 1 < config.trials {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
         }
-
-        let mut results = Vec::with_capacity(config.trials);
-        for _ in 0..config.trials {
-            let res = run_throughput_bench(mode, packet_size, concurrency, config).await?;
-            results.push(res);
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-        results.sort_by(|a, b| {
-            a.pps
-                .partial_cmp(&b.pps)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        Ok(results[results.len() / 2].clone())
+        Ok(BenchSummary::from_trials(trials))
     }
 
     fn print_header() {
@@ -834,7 +1004,8 @@ mod linux {
         );
     }
 
-    fn print_result(r: &BenchResult) {
+    fn print_result(s: &BenchSummary) {
+        let r = &s.representative;
         let mode_str = match r.mode {
             Mode::Baseline => "Baseline".to_string(),
             Mode::Grouped(b) => format!("Group-{}", b),
@@ -848,37 +1019,37 @@ mod linux {
         } else {
             format!("{}/{}", r.latency_samples, r.latency_timeouts)
         };
-        let p50_str = match r.p50_rtt_us {
+        let p50_str = match s.median_p50_rtt_us {
             Some(v) => format!("{:>8.1}", v),
             None => "     N/A".to_string(),
         };
-        let p95_str = match r.p95_rtt_us {
+        let p95_str = match s.median_p95_rtt_us {
             Some(v) => format!("{:>8.1}", v),
             None => "     N/A".to_string(),
         };
-        let p99_str = match r.p99_rtt_us {
+        let p99_str = match s.median_p99_rtt_us {
             Some(v) => format!("{:>8.1}", v),
             None => "     N/A".to_string(),
         };
         println!(
-        "| {:<10} | {:>5} | {:>4} | {:>10.0} | {:>7.2} | {:>5.1}% ({:>4.1}+{:<4.1}) | {:>10.0} | {:>12.2} | {:>5.2}% | {} | {} | {} | {:>10} | {:>7} KB |",
-        mode_str,
-        r.packet_size,
-        r.concurrency,
-        r.pps,
-        r.mib_per_sec,
-        r.total_cpu_pct,
-        r.user_cpu_pct,
-        r.sys_cpu_pct,
-        r.cpu_ns_per_pkt,
-        r.io_ops_per_pkt,
-        r.packet_loss_pct,
-        p50_str,
-        p95_str,
-        p99_str,
-        pings_str,
-        r.peak_rss_kb,
-    );
+            "| {:<10} | {:>5} | {:>4} | {:>10.0} | {:>7.2} | {:>5.1}% ({:>4.1}+{:<4.1}) | {:>10.0} | {:>12.2} | {:>5.2}% | {} | {} | {} | {:>10} | {:>7} KB |",
+            mode_str,
+            r.packet_size,
+            r.concurrency,
+            s.median_pps,
+            s.median_mib_per_sec,
+            s.median_cpu_pct,
+            r.user_cpu_pct,
+            r.sys_cpu_pct,
+            s.median_cpu_ns_per_pkt,
+            s.median_io_ops_per_pkt,
+            s.median_loss_pct,
+            p50_str,
+            p95_str,
+            p99_str,
+            pings_str,
+            r.peak_rss_kb,
+        );
     }
 
     pub async fn run() -> io::Result<()> {
@@ -999,23 +1170,27 @@ mod linux {
         println!();
 
         if let Some(path) = &config.csv_path {
-            let mut content = String::from(BenchResult::csv_header());
-            for r in &all_results {
-                content.push_str(&r.to_csv_row());
+            let mut content = String::from(TrialResult::csv_header());
+            for summary in &all_results {
+                for trial in &summary.raw_trials {
+                    content.push_str(&trial.to_csv_row());
+                }
             }
             std::fs::write(path, content)?;
+            let total_trials: usize = all_results.iter().map(|s| s.raw_trials.len()).sum();
             println!(
-                "Exported {} benchmark results to CSV: {path}",
+                "Exported {} individual trial observations across {} configurations to CSV: {path}",
+                total_trials,
                 all_results.len()
             );
         }
 
         if let Some(path) = &config.json_path {
-            let json_rows: Vec<String> = all_results.iter().map(|r| r.to_json()).collect();
+            let json_rows: Vec<String> = all_results.iter().map(|s| s.to_json()).collect();
             let json_content = format!("[\n  {}\n]\n", json_rows.join(",\n  "));
             std::fs::write(path, json_content)?;
             println!(
-                "Exported {} benchmark results to JSON: {path}",
+                "Exported {} benchmark summaries with raw trials to JSON: {path}",
                 all_results.len()
             );
         }
