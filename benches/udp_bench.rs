@@ -40,56 +40,143 @@ mod linux {
     }
 
     impl BenchConfig {
-        pub fn from_env() -> Self {
+        pub fn validate(&self) -> io::Result<()> {
+            if self.duration == Duration::ZERO {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "UDP_BENCH_DURATION_MS must be greater than 0",
+                ));
+            }
+            if self.duration > Duration::from_secs(3600) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "UDP_BENCH_DURATION_MS exceeds maximum allowed duration (3600s)",
+                ));
+            }
+            if self.warmup_duration > Duration::from_secs(600) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "UDP_BENCH_WARMUP_MS exceeds maximum allowed duration (600s)",
+                ));
+            }
+            if self.probe_interval == Duration::ZERO {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "UDP_BENCH_PROBE_INTERVAL_MS must be greater than 0",
+                ));
+            }
+            if self.probe_timeout == Duration::ZERO {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "UDP_BENCH_PROBE_TIMEOUT_MS must be greater than 0",
+                ));
+            }
+            if self.min_latency_samples == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "UDP_BENCH_MIN_SAMPLES must be greater than 0",
+                ));
+            }
+            if self.trials == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "UDP_BENCH_TRIALS must be greater than 0",
+                ));
+            }
+            if self.trials > 1000 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "UDP_BENCH_TRIALS exceeds maximum allowed trials (1000)",
+                ));
+            }
+            Ok(())
+        }
+
+        pub fn from_env() -> io::Result<Self> {
             let mut cfg = Self::default();
             if let Ok(v) = std::env::var("UDP_BENCH_DURATION_MS") {
-                if let Ok(ms) = v.parse::<u64>() {
-                    cfg.duration = Duration::from_millis(ms);
-                }
+                let ms = v.parse::<u64>().map_err(|e| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("Invalid UDP_BENCH_DURATION_MS '{v}': {e}"),
+                    )
+                })?;
+                cfg.duration = Duration::from_millis(ms);
             }
             if let Ok(v) = std::env::var("UDP_BENCH_WARMUP_MS") {
-                if let Ok(ms) = v.parse::<u64>() {
-                    cfg.warmup_duration = Duration::from_millis(ms);
-                }
+                let ms = v.parse::<u64>().map_err(|e| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("Invalid UDP_BENCH_WARMUP_MS '{v}': {e}"),
+                    )
+                })?;
+                cfg.warmup_duration = Duration::from_millis(ms);
             }
             if let Ok(v) = std::env::var("UDP_BENCH_PROBE_INTERVAL_MS") {
-                if let Ok(ms) = v.parse::<u64>() {
-                    cfg.probe_interval = Duration::from_millis(ms);
-                }
+                let ms = v.parse::<u64>().map_err(|e| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("Invalid UDP_BENCH_PROBE_INTERVAL_MS '{v}': {e}"),
+                    )
+                })?;
+                cfg.probe_interval = Duration::from_millis(ms);
             }
             if let Ok(v) = std::env::var("UDP_BENCH_PROBE_TIMEOUT_MS") {
-                if let Ok(ms) = v.parse::<u64>() {
-                    cfg.probe_timeout = Duration::from_millis(ms);
-                }
+                let ms = v.parse::<u64>().map_err(|e| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("Invalid UDP_BENCH_PROBE_TIMEOUT_MS '{v}': {e}"),
+                    )
+                })?;
+                cfg.probe_timeout = Duration::from_millis(ms);
             }
             if let Ok(v) = std::env::var("UDP_BENCH_MIN_SAMPLES") {
-                if let Ok(n) = v.parse::<usize>() {
-                    cfg.min_latency_samples = n;
-                }
+                let n = v.parse::<usize>().map_err(|e| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("Invalid UDP_BENCH_MIN_SAMPLES '{v}': {e}"),
+                    )
+                })?;
+                cfg.min_latency_samples = n;
             }
             if let Ok(v) = std::env::var("UDP_BENCH_TRIALS") {
-                if let Ok(n) = v.parse::<usize>() {
-                    if n > 0 {
-                        cfg.trials = n;
-                    }
-                }
+                let n = v.parse::<usize>().map_err(|e| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("Invalid UDP_BENCH_TRIALS '{v}': {e}"),
+                    )
+                })?;
+                cfg.trials = n;
             }
             if let Ok(v) = std::env::var("UDP_BENCH_SEED") {
-                if let Ok(s) = v.parse::<u64>() {
-                    cfg.seed = s;
-                }
+                let s = v.parse::<u64>().map_err(|e| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("Invalid UDP_BENCH_SEED '{v}': {e}"),
+                    )
+                })?;
+                cfg.seed = s;
             }
             if let Ok(path) = std::env::var("UDP_BENCH_CSV") {
-                if !path.trim().is_empty() {
-                    cfg.csv_path = Some(path);
+                if path.trim().is_empty() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "UDP_BENCH_CSV path must not be empty",
+                    ));
                 }
+                cfg.csv_path = Some(path);
             }
             if let Ok(path) = std::env::var("UDP_BENCH_JSON") {
-                if !path.trim().is_empty() {
-                    cfg.json_path = Some(path);
+                if path.trim().is_empty() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "UDP_BENCH_JSON path must not be empty",
+                    ));
                 }
+                cfg.json_path = Some(path);
             }
-            cfg
+            cfg.validate()?;
+            Ok(cfg)
         }
     }
 
@@ -391,6 +478,21 @@ mod linux {
                 trials_json.join(",\n    ")
             )
         }
+    }
+
+    pub fn compute_latency_percentiles(
+        samples: &mut [f64],
+        min_samples: usize,
+    ) -> (Option<f64>, Option<f64>, Option<f64>) {
+        if samples.is_empty() || samples.len() < min_samples {
+            return (None, None, None);
+        }
+        samples.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        (
+            Some(samples[samples.len() * 50 / 100]),
+            Some(samples[samples.len() * 95 / 100]),
+            Some(samples[samples.len() * 99 / 100]),
+        )
     }
 
     fn get_rusage() -> io::Result<libc::rusage> {
@@ -931,16 +1033,8 @@ mod linux {
         let invol_cs = rusage_stop.ru_nivcsw - rusage_start.ru_nivcsw;
         let peak_rss_kb = rusage_stop.ru_maxrss;
 
-        let (p50, p95, p99) = if latency_samples.len() >= config.min_latency_samples {
-            latency_samples.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-            (
-                Some(latency_samples[latency_samples.len() * 50 / 100]),
-                Some(latency_samples[latency_samples.len() * 95 / 100]),
-                Some(latency_samples[latency_samples.len() * 99 / 100]),
-            )
-        } else {
-            (None, None, None)
-        };
+        let (p50, p95, p99) =
+            compute_latency_percentiles(&mut latency_samples, config.min_latency_samples);
 
         let batch_size = match mode {
             Mode::Baseline => 1,
@@ -1117,6 +1211,7 @@ mod linux {
     );
         let test_sock = UdpSocket::bind("127.0.0.1:0").await?;
         let (eff_rcv, eff_snd) = configure_socket(&test_sock)?;
+        config_tests::run_self_tests();
         println!(
         "Host: Linux x86_64, local loopback. Effective socket buffers: SO_RCVBUF = {} bytes ({} KB), SO_SNDBUF = {} bytes ({} KB).",
         eff_rcv,
@@ -1126,7 +1221,7 @@ mod linux {
     );
         println!();
 
-        let config = BenchConfig::from_env();
+        let config = BenchConfig::from_env()?;
         if config.trials > 1 {
             println!(
                 "Running with {} trials per benchmark case (interleaved deterministic ordering, seed: {}).",
@@ -1247,6 +1342,95 @@ mod linux {
 
         println!("Benchmark execution completed successfully.");
         Ok(())
+    }
+
+    mod config_tests {
+        use super::*;
+
+        pub fn run_self_tests() {
+            test_default_config_is_valid();
+            test_validation_rejects_zero_duration();
+            test_validation_rejects_excessive_duration();
+            test_validation_rejects_zero_probe_interval();
+            test_validation_rejects_zero_probe_timeout();
+            test_validation_rejects_zero_min_samples();
+            test_validation_rejects_zero_trials();
+            test_validation_rejects_excessive_trials();
+            test_percentiles_empty_samples();
+            test_percentiles_insufficient_samples();
+            test_percentiles_valid_samples();
+        }
+
+        fn test_default_config_is_valid() {
+            let cfg = BenchConfig::default();
+            assert!(cfg.validate().is_ok());
+        }
+
+        fn test_validation_rejects_zero_duration() {
+            let mut cfg = BenchConfig::default();
+            cfg.duration = Duration::ZERO;
+            assert!(cfg.validate().is_err());
+        }
+
+        fn test_validation_rejects_excessive_duration() {
+            let mut cfg = BenchConfig::default();
+            cfg.duration = Duration::from_secs(3601);
+            assert!(cfg.validate().is_err());
+        }
+
+        fn test_validation_rejects_zero_probe_interval() {
+            let mut cfg = BenchConfig::default();
+            cfg.probe_interval = Duration::ZERO;
+            assert!(cfg.validate().is_err());
+        }
+
+        fn test_validation_rejects_zero_probe_timeout() {
+            let mut cfg = BenchConfig::default();
+            cfg.probe_timeout = Duration::ZERO;
+            assert!(cfg.validate().is_err());
+        }
+
+        fn test_validation_rejects_zero_min_samples() {
+            let mut cfg = BenchConfig::default();
+            cfg.min_latency_samples = 0;
+            assert!(cfg.validate().is_err());
+        }
+
+        fn test_validation_rejects_zero_trials() {
+            let mut cfg = BenchConfig::default();
+            cfg.trials = 0;
+            assert!(cfg.validate().is_err());
+        }
+
+        fn test_validation_rejects_excessive_trials() {
+            let mut cfg = BenchConfig::default();
+            cfg.trials = 1001;
+            assert!(cfg.validate().is_err());
+        }
+
+        fn test_percentiles_empty_samples() {
+            let mut empty: Vec<f64> = Vec::new();
+            let (p50, p95, p99) = compute_latency_percentiles(&mut empty, 1);
+            assert!(p50.is_none());
+            assert!(p95.is_none());
+            assert!(p99.is_none());
+        }
+
+        fn test_percentiles_insufficient_samples() {
+            let mut samples = vec![10.0, 20.0];
+            let (p50, p95, p99) = compute_latency_percentiles(&mut samples, 5);
+            assert!(p50.is_none());
+            assert!(p95.is_none());
+            assert!(p99.is_none());
+        }
+
+        fn test_percentiles_valid_samples() {
+            let mut samples: Vec<f64> = (1..=100).map(|x| x as f64).collect();
+            let (p50, p95, p99) = compute_latency_percentiles(&mut samples, 10);
+            assert_eq!(p50, Some(51.0));
+            assert_eq!(p95, Some(96.0));
+            assert_eq!(p99, Some(100.0));
+        }
     }
 }
 
