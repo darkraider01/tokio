@@ -48,6 +48,9 @@ cfg_net! {
         mod udp;
         #[doc(inline)]
         pub use udp::UdpSocket;
+
+        #[cfg(all(target_os = "linux", feature = "net"))]
+        pub mod udp_batch;
     }
 }
 
