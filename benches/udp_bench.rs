@@ -2,7 +2,6 @@
 
 #![cfg(target_os = "linux")]
 
-use std::arch::x86_64::_rdtsc;
 use std::io;
 use std::os::unix::io::AsRawFd;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -38,7 +37,8 @@ pub struct BenchResult {
     pub user_cpu_pct: f64,
     pub sys_cpu_pct: f64,
     pub total_cpu_pct: f64,
-    pub cycles_per_pkt: f64,
+    /// Aggregate CPU time (user + system) consumed per delivered packet, in nanoseconds.
+    pub cpu_ns_per_pkt: f64,
     /// Proxy metric for system call efficiency: successful socket operations per delivered packet.
     pub io_ops_per_pkt: f64,
     pub packet_loss_pct: f64,
@@ -337,7 +337,6 @@ pub async fn run_throughput_bench(
 
     // Synchronize workers so all tasks release simultaneously at the start of measurement
     let rusage_start = get_rusage();
-    let tsc_start = unsafe { _rdtsc() };
     let start_time = Instant::now();
     start_barrier.wait().await;
 
@@ -382,7 +381,6 @@ pub async fn run_throughput_bench(
     }
 
     let elapsed = start_time.elapsed();
-    let tsc_end = unsafe { _rdtsc() };
     let rusage_end = get_rusage();
 
     let total_recv = timed_recv + drained_recv;
@@ -403,9 +401,9 @@ pub async fn run_throughput_bench(
     let bytes_recv = timed_recv * (packet_size as u64);
     let mbps = (bytes_recv as f64) / (1024.0 * 1024.0 * elapsed_sec);
 
-    let total_cycles = tsc_end.saturating_sub(tsc_start);
-    let cycles_per_pkt = if total_recv > 0 {
-        (total_cycles as f64) / (total_recv as f64)
+    let total_cpu_time = utime_diff + stime_diff;
+    let cpu_ns_per_pkt = if total_recv > 0 {
+        (total_cpu_time.as_nanos() as f64) / (total_recv as f64)
     } else {
         0.0
     };
@@ -454,7 +452,7 @@ pub async fn run_throughput_bench(
         user_cpu_pct,
         sys_cpu_pct,
         total_cpu_pct,
-        cycles_per_pkt,
+        cpu_ns_per_pkt,
         io_ops_per_pkt,
         packet_loss_pct,
         p50_rtt_us: p50,
@@ -468,7 +466,7 @@ pub async fn run_throughput_bench(
 
 fn print_header() {
     println!(
-        "| Mode | PktSz | Conc | Pkts/sec | MByte/s | CPU% (U+S) | Cycles/Pkt | IO-Ops/Pkt | Loss % | p50 (us) | p95 (us) | p99 (us) | Peak RSS |"
+        "| Mode | PktSz | Conc | Pkts/sec | MByte/s | CPU% (U+S) | CPU-ns/Pkt | IO-Ops/Pkt | Loss % | p50 (us) | p95 (us) | p99 (us) | Peak RSS |"
     );
     println!("|:---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|");
 }
@@ -489,7 +487,7 @@ fn print_result(r: &BenchResult) {
         r.total_cpu_pct,
         r.user_cpu_pct,
         r.sys_cpu_pct,
-        r.cycles_per_pkt,
+        r.cpu_ns_per_pkt,
         r.io_ops_per_pkt,
         r.packet_loss_pct,
         r.p50_rtt_us,
