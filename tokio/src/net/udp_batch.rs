@@ -297,6 +297,9 @@ fn setup_and_call_sendmmsg(
 
             if let Some(target) = packets[i].destination {
                 let addr_ptr = addrs[i].as_mut_ptr();
+                // SAFETY: Zero-initialize the sockaddr_storage memory before constructing a
+                // mutable reference to it, ensuring the reference never aliases uninitialized memory.
+                std::ptr::write_bytes(addr_ptr, 0, 1);
                 let addr_len = encode_sockaddr(target, &mut *addr_ptr);
                 msg.msg_name = addr_ptr as *mut libc::c_void;
                 msg.msg_namelen = addr_len;
