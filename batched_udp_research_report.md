@@ -3,8 +3,10 @@
 **Author:** Antigravity (Pair Programming Senior Rust Networking Engineer & Runtime Contributor)  
 **Target Subsystem:** `tokio::net::UdpSocket` / Linux Network Stack  
 **Branch:** `experiment/udp-batching`  
-**Base Commit:** `eb9cdf2f` (171 commits behind upstream master)  
-**Current HEAD:** `9a7d1733` (22 atomic commits on branch)  
+**Base Commit:** `eb9cdf2ff012ec22d4efd74cf46d04222264cd8e` (`git merge-base HEAD upstream/master`)  
+**Current HEAD:** `abeab870` (`git rev-parse --short HEAD`)  
+**Total Commits Ahead of Base:** 41 commits (`git rev-list --count eb9cdf2f..HEAD`)  
+**Commit Series Breakdown:** 6 prototype commits + 12 remediation series 1 + 15 remediation series 2 + 8 remediation series 3  
 **Kernel & Architecture:** Linux 6.19.10 x86_64 (12 Cores, Local Loopback)  
 
 ---
@@ -179,37 +181,64 @@ All 21 comprehensive test cases pass in **0.03s**:
 
 ## 4. Chronological Commit Ledger
 
-All changes on branch `experiment/udp-batching` adhere strictly to the **one logical fix per commit** requirement:
+All commits on branch `experiment/udp-batching` ahead of `eb9cdf2ff012ec22d4efd74cf46d04222264cd8e` adhere strictly to the **one logical fix per commit** requirement. The exact commit history was determined using `git log --oneline eb9cdf2f..HEAD` (41 commits total):
 
+### Part 1: Initial Prototype Implementation (6 Commits)
 | # | Commit | Type & Scope | Summary |
 |---|---|---|---|
-| 1 | `609c4cef` | `fix(net)` | Initialize sockaddr storage before encoding (fixed UB with `write_bytes`) |
-| 2 | `d9c4fe74` | `fix(net)` | Correct IPv6 flowinfo byte order (`sin6_flowinfo.to_be()`) |
-| 3 | `4b424c99` | `fix(bench)` | Replace hot-path atomic accounting with local counters |
-| 4 | `197f74af` | `fix(bench)` | Align throughput measurement windows with barrier synchronization |
-| 5 | `a1926249` | `fix(bench)` | Distinguish IO calls from syscalls (`IO-Ops/Pkt`) |
-| 6 | `096a660d` | `fix(bench)` | Remove misleading CPU cycle metric (replace RDTSC with `getrusage`) |
-| 7 | `27e24d5b` | `fix(bench)` | Verify effective UDP socket buffers (`SO_RCVBUF` / `SO_SNDBUF`) |
-| 8 | `ed06c817` | `fix(bench)` | Validate latency probe sequence numbers to reject stale packets |
-| 9 | `9976e492` | `refactor(net)` | Keep sockaddr conversion helpers private (`pub(crate)`) |
-| 10 | `4a335c1c` | `fix(bench)` | Log effective socket buffer sizes on startup |
-| 11 | `346c9156` | `style(bench)` | Format UDP benchmark source |
-| 12 | `2b05c1b8` | `fix(bench)` | Iterate directly over receivers without indexing |
-| 13 | `9478e246` | `fix(bench)` | Guard Linux-specific benchmark entry point for non-Linux targets |
-| 14 | `2f6f6ec2` | `fix(bench)` | Propagate worker and join failures to prevent partial silent runs |
-| 15 | `80c7d393` | `fix(bench)` | Complete warmup shutdown before measurement |
-| 16 | `86339d10` | `fix(bench)` | Align packet accounting and measurement intervals (isolate post-stop drain) |
-| 17 | `19d9692e` | `fix(bench)` | Reject invalid latency measurements and format missing stats as N/A |
-| 18 | `9cb3367b` | `perf(bench)` | Make latency sampling configurable via struct and environment variables |
-| 19 | `0b0c6cb2` | `perf(bench)` | Add repeated trials and result export (CSV and JSON machine-readable) |
-| 20 | `6cad5b60` | `docs(net)` | Clarify batch size and fairness semantics (`MAX_BATCH_SIZE = 1024`) |
-| 21 | `996f53e5` | `test(net)` | Cover heap-backed receive batches (> 64 buffers) |
-| 22 | `993cc5e5` | `test(net)` | Verify partial send progress semantics |
-| 23 | `66202e2f` | `test(net)` | Exercise batched poll readiness transitions |
-| 24 | `86d1795b` | `test(net)` | Expand concurrency and cancellation test coverage |
-| 25 | `0b1e046f` | `docs(net)` | Clarify batched UDP method contracts and MSRV design |
-| 26 | `2fe9c9df` | `fix(bench)` | Check process resource usage errors (`getrusage`) |
-| 27 | `9a7d1733` | `docs(bench)` | Use accurate throughput units (`MiB/s`) |
+| 1 | `5897e3af` | `feat(net)` | Add experimental Linux batched UDP backend (`recvmmsg`/`sendmmsg`) |
+| 2 | `a5886e13` | `test(net)` | Add tests for batched UDP operations |
+| 3 | `0697460b` | `bench(net)` | Add UDP baseline and batched benchmark suite |
+| 4 | `b4637f21` | `fix(net)` | Fix readiness interest, bounds, and sockaddr conversion in batched UDP |
+| 5 | `6d6662eb` | `test(net)` | Expand test suite for batched UDP socket operations |
+| 6 | `83944eb0` | `bench(net)` | Add three-way comparison and repair accounting in UDP benchmark |
+
+### Part 2: Remediation Series 1 (12 Commits)
+| # | Commit | Type & Scope | Summary |
+|---|---|---|---|
+| 7 | `609c4cef` | `fix(net)` | Initialize sockaddr storage before encoding (fixed UB with `write_bytes`) |
+| 8 | `d9c4fe74` | `fix(net)` | Correct IPv6 flowinfo byte order (`sin6_flowinfo.to_be()`) |
+| 9 | `4b424c99` | `fix(bench)` | Replace hot-path atomic accounting with local counters |
+| 10 | `197f74af` | `fix(bench)` | Align throughput measurement windows with barrier synchronization |
+| 11 | `a1926249` | `fix(bench)` | Distinguish IO calls from syscalls (`IO-Ops/Pkt`) |
+| 12 | `096a660d` | `fix(bench)` | Remove misleading CPU cycle metric (replace RDTSC with `getrusage`) |
+| 13 | `27e24d5b` | `fix(bench)` | Verify effective UDP socket buffers (`SO_RCVBUF` / `SO_SNDBUF`) |
+| 14 | `ed06c817` | `fix(bench)` | Validate latency probe sequence numbers to reject stale packets |
+| 15 | `9976e492` | `refactor(net)` | Keep sockaddr conversion helpers private (`pub(crate)`) |
+| 16 | `4a335c1c` | `fix(bench)` | Log effective socket buffer sizes on startup |
+| 17 | `346c9156` | `style(bench)` | Format UDP benchmark source |
+| 18 | `2b05c1b8` | `fix(bench)` | Iterate directly over receivers without indexing |
+
+### Part 3: Remediation Series 2 (15 Commits)
+| # | Commit | Type & Scope | Summary |
+|---|---|---|---|
+| 19 | `9478e246` | `fix(bench)` | Guard Linux-specific benchmark entry point for non-Linux targets |
+| 20 | `2f6f6ec2` | `fix(bench)` | Propagate worker and join failures to prevent partial silent runs |
+| 21 | `80c7d393` | `fix(bench)` | Complete warmup shutdown before measurement |
+| 22 | `86339d10` | `fix(bench)` | Align packet accounting and measurement intervals (isolate post-stop drain) |
+| 23 | `19d9692e` | `fix(bench)` | Reject invalid latency measurements and format missing stats as N/A |
+| 24 | `9cb3367b` | `perf(bench)` | Make latency sampling configurable via struct and environment variables |
+| 25 | `0b0c6cb2` | `perf(bench)` | Add repeated trials and result export (CSV and JSON machine-readable) |
+| 26 | `6cad5b60` | `docs(net)` | Clarify batch size and fairness semantics (`MAX_BATCH_SIZE = 1024`) |
+| 27 | `996f53e5` | `test(net)` | Cover heap-backed receive batches (> 64 buffers) |
+| 28 | `993cc5e5` | `test(net)` | Verify partial send progress semantics |
+| 29 | `66202e2f` | `test(net)` | Exercise batched poll readiness transitions |
+| 30 | `86d1795b` | `test(net)` | Expand concurrency and cancellation test coverage |
+| 31 | `0b1e046f` | `docs(net)` | Clarify batched UDP method contracts and MSRV design |
+| 32 | `2fe9c9df` | `fix(bench)` | Check process resource usage errors (`getrusage`) |
+| 33 | `9a7d1733` | `docs(bench)` | Use accurate throughput units (`MiB/s`) |
+
+### Part 4: Final Hardening Series 3 (8 Commits)
+| # | Commit | Type & Scope | Summary |
+|---|---|---|---|
+| 34 | `eb6c87d2` | `fix(bench)` | Align packet counts with measurement intervals (two-phase shutdown and boundary alignment) |
+| 35 | `67f1d2d0` | `fix(bench)` | Preserve individual benchmark trials and compute statistical summaries (`TrialResult` / `BenchSummary`) |
+| 36 | `69899924` | `perf(bench)` | Alternate benchmark execution order with deterministic round-robin shuffling |
+| 37 | `a60d4767` | `fix(bench)` | Validate benchmark configuration and guard percentile calculations |
+| 38 | `5ce1fccd` | `test(net)` | Make bounded batch progress test reliable with concurrent receiver |
+| 39 | `76ed2124` | `test(net)` | Synchronize receiver cancellation deterministically |
+| 40 | `5314bf5f` | `docs(net)` | Clarify batch fairness and cooperative scheduling |
+| 41 | `abeab870` | `docs` | Correct UDP batching performance claims and units |
 
 ---
 
