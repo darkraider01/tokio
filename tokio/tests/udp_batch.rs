@@ -779,3 +779,126 @@ async fn test_poll_readiness_transitions() -> io::Result<()> {
     .await
     .expect("test timed out")
 }
+
+#[tokio::test]
+async fn test_concurrent_senders_shared_socket() -> io::Result<()> {
+    use std::collections::HashSet;
+
+    time::timeout(TEST_TIMEOUT, async {
+        let sender = Arc::new(UdpSocket::bind("127.0.0.1:0").await?);
+        let receiver = UdpSocket::bind("127.0.0.1:0").await?;
+        let recv_addr = receiver.local_addr()?;
+        let send_addr = sender.local_addr()?;
+
+        let num_senders = 4;
+        let packets_per_sender = 25;
+        let total_packets = num_senders * packets_per_sender;
+
+        let mut send_tasks = Vec::new();
+        for sender_id in 0..num_senders {
+            let s = sender.clone();
+            send_tasks.push(tokio::spawn(async move {
+                let payloads: Vec<Vec<u8>> = (0..packets_per_sender)
+                    .map(|seq| format!("s{sender_id}-p{seq}").into_bytes())
+                    .collect();
+                let batch: Vec<Datagram<'_>> = payloads
+                    .iter()
+                    .map(|p| Datagram::to_addr(p, recv_addr))
+                    .collect();
+
+                let mut sent = 0;
+                while sent < packets_per_sender {
+                    let n = s.send_many(&batch[sent..]).await.unwrap();
+                    sent += n;
+                    tokio::task::yield_now().await;
+                }
+                payloads
+            }));
+        }
+
+        let mut expected_payloads = HashSet::new();
+        for task in send_tasks {
+            let payloads = task.await.unwrap();
+            for p in payloads {
+                expected_payloads.insert(p);
+            }
+        }
+
+        let mut received_payloads = HashSet::new();
+        let mut raw_bufs: Vec<Vec<u8>> = (0..32).map(|_| vec![0u8; 64]).collect();
+        while received_payloads.len() < total_packets {
+            let mut inbound: Vec<InboundDatagram<'_>> = raw_bufs
+                .iter_mut()
+                .map(|b| InboundDatagram::new(b.as_mut_slice()))
+                .collect();
+            let n = receiver.recv_many(&mut inbound).await?;
+            assert!(n > 0);
+            for d in &inbound[..n] {
+                assert_eq!(d.source, Some(send_addr));
+                received_payloads.insert(d.payload().to_vec());
+            }
+        }
+
+        assert_eq!(received_payloads, expected_payloads);
+
+        Ok::<(), io::Error>(())
+    })
+    .await
+    .expect("test timed out")
+}
+
+#[tokio::test]
+async fn test_cancellation_waker_handover() -> io::Result<()> {
+    time::timeout(TEST_TIMEOUT, async {
+        let sender = UdpSocket::bind("127.0.0.1:0").await?;
+        let receiver = Arc::new(UdpSocket::bind("127.0.0.1:0").await?);
+        let recv_addr = receiver.local_addr()?;
+        let send_addr = sender.local_addr()?;
+
+        let rx1 = receiver.clone();
+        let ready_barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let b1 = ready_barrier.clone();
+
+        // Task 1: starts waiting on empty socket, then is aborted
+        let task1 = tokio::spawn(async move {
+            let mut buf = [0u8; 64];
+            let mut inbound = [InboundDatagram::new(&mut buf)];
+            b1.wait().await;
+            rx1.recv_many(&mut inbound).await
+        });
+
+        ready_barrier.wait().await;
+        // Give task1 time to poll and register its waker on the socket
+        tokio::time::sleep(Duration::from_millis(15)).await;
+        task1.abort();
+
+        // Task 2: starts receiving on the same socket after task 1 is cancelled
+        let rx2 = receiver.clone();
+        let task2 = tokio::spawn(async move {
+            let mut buf = [0u8; 64];
+            let mut inbound = [InboundDatagram::new(&mut buf)];
+            let n = rx2.recv_many(&mut inbound).await?;
+            Ok::<(usize, Vec<u8>, Option<std::net::SocketAddr>), io::Error>((
+                n,
+                inbound[0].payload().to_vec(),
+                inbound[0].source,
+            ))
+        });
+
+        tokio::time::sleep(Duration::from_millis(15)).await;
+
+        // Now send datagram; task 2 must be awakened despite task 1 being aborted
+        sender
+            .send_many(&[Datagram::to_addr(b"waker handover", recv_addr)])
+            .await?;
+
+        let (n, payload, src) = task2.await.unwrap()?;
+        assert_eq!(n, 1);
+        assert_eq!(&payload[..], b"waker handover");
+        assert_eq!(src, Some(send_addr));
+
+        Ok::<(), io::Error>(())
+    })
+    .await
+    .expect("test timed out")
+}
