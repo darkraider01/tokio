@@ -111,5 +111,10 @@ name = "net_accept"
 path = "net_accept.rs"
 harness = false
 
+[[bench]]
+name = "udp_bench"
+path = "udp_bench.rs"
+harness = false
+
 [lints]
 workspace = true
