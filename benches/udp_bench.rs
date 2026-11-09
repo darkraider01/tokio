@@ -106,6 +106,7 @@ pub async fn run_throughput_bench(
 
     let running = Arc::new(AtomicBool::new(true));
     let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+    let start_barrier = Arc::new(tokio::sync::Barrier::new(concurrency * 2 + 1));
 
     // Warm-up phase (100ms): prime memory, kernel tables, and CPU caches.
     let warmup_running = Arc::new(AtomicBool::new(true));
@@ -140,18 +141,15 @@ pub async fn run_throughput_bench(
         while r.try_recv_from(&mut drain_buf).is_ok() {}
     }
 
-    // Capture baseline system state before the measurement window
-    let rusage_start = get_rusage();
-    let tsc_start = unsafe { _rdtsc() };
-    let start_time = Instant::now();
-
     // Spawn receiver tasks with plain local integer counters
     let mut recv_handles = Vec::with_capacity(concurrency);
     for i in 0..concurrency {
         let r = receivers[i].clone();
         let mut shutdown_rx = shutdown_tx.subscribe();
+        let barrier = start_barrier.clone();
 
         recv_handles.push(tokio::spawn(async move {
+            barrier.wait().await;
             let mut local_packets = 0u64;
             let mut local_syscalls = 0u64;
 
@@ -233,8 +231,10 @@ pub async fn run_throughput_bench(
         let s = senders[i].clone();
         let target = receiver_addrs[i];
         let run = running.clone();
+        let barrier = start_barrier.clone();
 
         send_handles.push(tokio::spawn(async move {
+            barrier.wait().await;
             let mut local_packets = 0u64;
             let mut local_syscalls = 0u64;
 
@@ -332,6 +332,12 @@ pub async fn run_throughput_bench(
         samples
     });
 
+    // Synchronize workers so all tasks release simultaneously at the start of measurement
+    let rusage_start = get_rusage();
+    let tsc_start = unsafe { _rdtsc() };
+    let start_time = Instant::now();
+    start_barrier.wait().await;
+
     // Run measurement duration
     tokio::time::sleep(duration).await;
     running.store(false, Ordering::Relaxed);
@@ -390,9 +396,9 @@ pub async fn run_throughput_bench(
     let sys_cpu_pct = (stime_diff.as_secs_f64() / elapsed_sec) * 100.0;
     let total_cpu_pct = user_cpu_pct + sys_cpu_pct;
 
-    let pps = (timed_recv as f64) / duration.as_secs_f64();
+    let pps = (timed_recv as f64) / elapsed_sec;
     let bytes_recv = timed_recv * (packet_size as u64);
-    let mbps = (bytes_recv as f64) / (1024.0 * 1024.0 * duration.as_secs_f64());
+    let mbps = (bytes_recv as f64) / (1024.0 * 1024.0 * elapsed_sec);
 
     let total_cycles = tsc_end.saturating_sub(tsc_start);
     let cycles_per_pkt = if total_recv > 0 {
