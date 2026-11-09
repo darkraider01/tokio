@@ -599,3 +599,52 @@ async fn test_poll_methods() -> io::Result<()> {
     .await
     .expect("test timed out")
 }
+
+#[tokio::test]
+async fn test_recv_many_heap_fallback() -> io::Result<()> {
+    time::timeout(TEST_TIMEOUT, async {
+        let sender = UdpSocket::bind("127.0.0.1:0").await?;
+        let receiver = UdpSocket::bind("127.0.0.1:0").await?;
+        let recv_addr = receiver.local_addr()?;
+        let send_addr = sender.local_addr()?;
+
+        // Test boundary at 65 datagrams (exceeding STACK_BATCH_SIZE = 64 by 1)
+        // and 80 datagrams to verify receive-side heap allocation fallback.
+        for &batch_count in &[65, 80] {
+            let payloads: Vec<Vec<u8>> = (0..batch_count)
+                .map(|i| format!("heap-pkt-{i:03}").into_bytes())
+                .collect();
+            let outbound: Vec<Datagram<'_>> = payloads
+                .iter()
+                .map(|p| Datagram::to_addr(p, recv_addr))
+                .collect();
+
+            let sent = sender.send_many(&outbound).await?;
+            assert_eq!(sent, batch_count);
+
+            let mut raw_bufs: Vec<Vec<u8>> = (0..batch_count).map(|_| vec![0u8; 64]).collect();
+            let mut inbound: Vec<InboundDatagram<'_>> = raw_bufs
+                .iter_mut()
+                .map(|b| InboundDatagram::new(b.as_mut_slice()))
+                .collect();
+
+            let mut total_received = 0;
+            while total_received < batch_count {
+                let n = receiver.recv_many(&mut inbound[total_received..]).await?;
+                assert!(n > 0);
+                total_received += n;
+            }
+
+            assert_eq!(total_received, batch_count);
+            for i in 0..batch_count {
+                assert_eq!(inbound[i].payload(), payloads[i].as_slice());
+                assert_eq!(inbound[i].source, Some(send_addr));
+                assert!(!inbound[i].truncated);
+            }
+        }
+
+        Ok::<(), io::Error>(())
+    })
+    .await
+    .expect("test timed out")
+}
