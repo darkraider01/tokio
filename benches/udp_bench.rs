@@ -10,6 +10,59 @@ mod linux {
     use tokio::net::udp_batch::{Datagram, InboundDatagram, UdpSocketBatchExt};
     use tokio::net::UdpSocket;
 
+    #[derive(Clone, Copy, Debug)]
+    pub struct BenchConfig {
+        pub duration: Duration,
+        pub warmup_duration: Duration,
+        pub probe_interval: Duration,
+        pub probe_timeout: Duration,
+        pub min_latency_samples: usize,
+    }
+
+    impl Default for BenchConfig {
+        fn default() -> Self {
+            Self {
+                duration: Duration::from_millis(400),
+                warmup_duration: Duration::from_millis(100),
+                probe_interval: Duration::from_millis(2),
+                probe_timeout: Duration::from_millis(25),
+                min_latency_samples: 10,
+            }
+        }
+    }
+
+    impl BenchConfig {
+        pub fn from_env() -> Self {
+            let mut cfg = Self::default();
+            if let Ok(v) = std::env::var("UDP_BENCH_DURATION_MS") {
+                if let Ok(ms) = v.parse::<u64>() {
+                    cfg.duration = Duration::from_millis(ms);
+                }
+            }
+            if let Ok(v) = std::env::var("UDP_BENCH_WARMUP_MS") {
+                if let Ok(ms) = v.parse::<u64>() {
+                    cfg.warmup_duration = Duration::from_millis(ms);
+                }
+            }
+            if let Ok(v) = std::env::var("UDP_BENCH_PROBE_INTERVAL_MS") {
+                if let Ok(ms) = v.parse::<u64>() {
+                    cfg.probe_interval = Duration::from_millis(ms);
+                }
+            }
+            if let Ok(v) = std::env::var("UDP_BENCH_PROBE_TIMEOUT_MS") {
+                if let Ok(ms) = v.parse::<u64>() {
+                    cfg.probe_timeout = Duration::from_millis(ms);
+                }
+            }
+            if let Ok(v) = std::env::var("UDP_BENCH_MIN_SAMPLES") {
+                if let Ok(n) = v.parse::<usize>() {
+                    cfg.min_latency_samples = n;
+                }
+            }
+            cfg
+        }
+    }
+
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub enum Mode {
         Baseline,
@@ -133,7 +186,7 @@ mod linux {
         mode: Mode,
         packet_size: usize,
         concurrency: usize,
-        duration: Duration,
+        config: &BenchConfig,
     ) -> io::Result<BenchResult> {
         // Sockets setup: `concurrency` pairs of sockets.
         let mut receivers = Vec::with_capacity(concurrency);
@@ -183,7 +236,7 @@ mod linux {
                 }
             }));
         }
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::time::sleep(config.warmup_duration).await;
         warmup_running.store(false, Ordering::Relaxed);
         for h in &warmup_handles {
             h.abort();
@@ -371,6 +424,8 @@ mod linux {
             }
         });
 
+        let probe_interval = config.probe_interval;
+        let probe_timeout = config.probe_timeout;
         let probe_run2 = running.clone();
         let probe_barrier = start_barrier.clone();
         let probe_h = tokio::spawn(async move {
@@ -387,7 +442,7 @@ mod linux {
                 ping_payload[0..8].copy_from_slice(&seq.to_be_bytes());
 
                 let t0 = Instant::now();
-                let ping_res = tokio::time::timeout(Duration::from_millis(25), async {
+                let ping_res = tokio::time::timeout(probe_timeout, async {
                     probe_client.send_to(&ping_payload, probe_addr).await?;
                     loop {
                         let (n, _) = probe_client.recv_from(&mut buf).await?;
@@ -426,7 +481,7 @@ mod linux {
                         timeouts += 1;
                     }
                 }
-                tokio::time::sleep(Duration::from_millis(2)).await;
+                tokio::time::sleep(probe_interval).await;
             }
             (samples, timeouts, invalid_replies)
         });
@@ -437,7 +492,7 @@ mod linux {
         let rusage_start = get_rusage();
 
         // Run measurement duration
-        tokio::time::sleep(duration).await;
+        tokio::time::sleep(config.duration).await;
         let measurement_stop_time = Instant::now();
         let rusage_stop = get_rusage();
         let actual_measurement_duration = measurement_stop_time.duration_since(start_time);
@@ -502,8 +557,9 @@ mod linux {
             }
         }
 
+        let join_timeout = config.probe_timeout + Duration::from_millis(500);
         let (mut latency_samples, latency_timeouts, latency_invalid) =
-            match tokio::time::timeout(Duration::from_millis(500), probe_h).await {
+            match tokio::time::timeout(join_timeout, probe_h).await {
                 Ok(Ok(stats)) => stats,
                 Ok(Err(panic_err)) => {
                     if worker_error.is_none() {
@@ -581,7 +637,7 @@ mod linux {
         let invol_cs = rusage_stop.ru_nivcsw - rusage_start.ru_nivcsw;
         let peak_rss_kb = rusage_stop.ru_maxrss;
 
-        let (p50, p95, p99) = if !latency_samples.is_empty() {
+        let (p50, p95, p99) = if latency_samples.len() >= config.min_latency_samples {
             latency_samples.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
             (
                 Some(latency_samples[latency_samples.len() * 50 / 100]),
@@ -703,10 +759,10 @@ mod linux {
     );
         println!();
 
+        let config = BenchConfig::from_env();
         let packet_sizes = [64, 512, 1200, 1472];
         let concurrencies = [1, 4, 16, 64];
         let batch_sizes = [4, 8, 16, 32, 64];
-        let duration = Duration::from_millis(400);
 
         // Section 1: Baseline Tokio across all Packet Sizes and Concurrencies
         println!(
@@ -715,7 +771,7 @@ mod linux {
         print_header();
         for &pkt in &packet_sizes {
             for &conc in &concurrencies {
-                let res = run_throughput_bench(Mode::Baseline, pkt, conc, duration).await?;
+                let res = run_throughput_bench(Mode::Baseline, pkt, conc, &config).await?;
                 print_result(&res);
             }
         }
@@ -724,12 +780,12 @@ mod linux {
         // Section 2: Three-Way Comparison: Baseline vs Grouped vs Batched (64B packets, 16x16 concurrency)
         println!("### PART 2: Three-Way Comparison (Packet Size: 64B, Concurrency: 16x16)");
         print_header();
-        let b_res = run_throughput_bench(Mode::Baseline, 64, 16, duration).await?;
+        let b_res = run_throughput_bench(Mode::Baseline, 64, 16, &config).await?;
         print_result(&b_res);
         for &bs in &batch_sizes {
-            let g_res = run_throughput_bench(Mode::Grouped(bs), 64, 16, duration).await?;
+            let g_res = run_throughput_bench(Mode::Grouped(bs), 64, 16, &config).await?;
             print_result(&g_res);
-            let res = run_throughput_bench(Mode::Batched(bs), 64, 16, duration).await?;
+            let res = run_throughput_bench(Mode::Batched(bs), 64, 16, &config).await?;
             print_result(&res);
         }
         println!();
@@ -737,12 +793,12 @@ mod linux {
         // Section 3: Three-Way Comparison: Baseline vs Grouped vs Batched (1472B packets, 16x16 concurrency)
         println!("### PART 3: Three-Way Comparison (Packet Size: 1472B, Concurrency: 16x16)");
         print_header();
-        let b_res1472 = run_throughput_bench(Mode::Baseline, 1472, 16, duration).await?;
+        let b_res1472 = run_throughput_bench(Mode::Baseline, 1472, 16, &config).await?;
         print_result(&b_res1472);
         for &bs in &batch_sizes {
-            let g_res = run_throughput_bench(Mode::Grouped(bs), 1472, 16, duration).await?;
+            let g_res = run_throughput_bench(Mode::Grouped(bs), 1472, 16, &config).await?;
             print_result(&g_res);
-            let res = run_throughput_bench(Mode::Batched(bs), 1472, 16, duration).await?;
+            let res = run_throughput_bench(Mode::Batched(bs), 1472, 16, &config).await?;
             print_result(&res);
         }
         println!();
@@ -753,11 +809,11 @@ mod linux {
         );
         print_header();
         for &conc in &concurrencies {
-            let b = run_throughput_bench(Mode::Baseline, 64, conc, duration).await?;
+            let b = run_throughput_bench(Mode::Baseline, 64, conc, &config).await?;
             print_result(&b);
-            let g = run_throughput_bench(Mode::Grouped(32), 64, conc, duration).await?;
+            let g = run_throughput_bench(Mode::Grouped(32), 64, conc, &config).await?;
             print_result(&g);
-            let batched = run_throughput_bench(Mode::Batched(32), 64, conc, duration).await?;
+            let batched = run_throughput_bench(Mode::Batched(32), 64, conc, &config).await?;
             print_result(&batched);
         }
         println!();
@@ -768,11 +824,11 @@ mod linux {
     );
         print_header();
         for &conc in &concurrencies {
-            let b = run_throughput_bench(Mode::Baseline, 1472, conc, duration).await?;
+            let b = run_throughput_bench(Mode::Baseline, 1472, conc, &config).await?;
             print_result(&b);
-            let g = run_throughput_bench(Mode::Grouped(32), 1472, conc, duration).await?;
+            let g = run_throughput_bench(Mode::Grouped(32), 1472, conc, &config).await?;
             print_result(&g);
-            let batched = run_throughput_bench(Mode::Batched(32), 1472, conc, duration).await?;
+            let batched = run_throughput_bench(Mode::Batched(32), 1472, conc, &config).await?;
             print_result(&batched);
         }
         println!();
