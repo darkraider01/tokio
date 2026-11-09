@@ -193,6 +193,7 @@ mod linux {
         pub io_ops: u64,
     }
 
+    #[allow(dead_code)]
     #[derive(Debug, Clone)]
     pub struct TrialResult {
         pub trial_index: usize,
@@ -318,6 +319,7 @@ mod linux {
         }
     }
 
+    #[allow(dead_code)]
     #[derive(Debug, Clone)]
     pub struct BenchSummary {
         pub mode: Mode,
@@ -1367,44 +1369,58 @@ mod linux {
         }
 
         fn test_validation_rejects_zero_duration() {
-            let mut cfg = BenchConfig::default();
-            cfg.duration = Duration::ZERO;
+            let cfg = BenchConfig {
+                duration: Duration::ZERO,
+                ..Default::default()
+            };
             assert!(cfg.validate().is_err());
         }
 
         fn test_validation_rejects_excessive_duration() {
-            let mut cfg = BenchConfig::default();
-            cfg.duration = Duration::from_secs(3601);
+            let cfg = BenchConfig {
+                duration: Duration::from_secs(3601),
+                ..Default::default()
+            };
             assert!(cfg.validate().is_err());
         }
 
         fn test_validation_rejects_zero_probe_interval() {
-            let mut cfg = BenchConfig::default();
-            cfg.probe_interval = Duration::ZERO;
+            let cfg = BenchConfig {
+                probe_interval: Duration::ZERO,
+                ..Default::default()
+            };
             assert!(cfg.validate().is_err());
         }
 
         fn test_validation_rejects_zero_probe_timeout() {
-            let mut cfg = BenchConfig::default();
-            cfg.probe_timeout = Duration::ZERO;
+            let cfg = BenchConfig {
+                probe_timeout: Duration::ZERO,
+                ..Default::default()
+            };
             assert!(cfg.validate().is_err());
         }
 
         fn test_validation_rejects_zero_min_samples() {
-            let mut cfg = BenchConfig::default();
-            cfg.min_latency_samples = 0;
+            let cfg = BenchConfig {
+                min_latency_samples: 0,
+                ..Default::default()
+            };
             assert!(cfg.validate().is_err());
         }
 
         fn test_validation_rejects_zero_trials() {
-            let mut cfg = BenchConfig::default();
-            cfg.trials = 0;
+            let cfg = BenchConfig {
+                trials: 0,
+                ..Default::default()
+            };
             assert!(cfg.validate().is_err());
         }
 
         fn test_validation_rejects_excessive_trials() {
-            let mut cfg = BenchConfig::default();
-            cfg.trials = 1001;
+            let cfg = BenchConfig {
+                trials: 1001,
+                ..Default::default()
+            };
             assert!(cfg.validate().is_err());
         }
 
