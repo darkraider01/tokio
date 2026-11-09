@@ -10,13 +10,16 @@ mod linux {
     use tokio::net::udp_batch::{Datagram, InboundDatagram, UdpSocketBatchExt};
     use tokio::net::UdpSocket;
 
-    #[derive(Clone, Copy, Debug)]
+    #[derive(Clone, Debug)]
     pub struct BenchConfig {
         pub duration: Duration,
         pub warmup_duration: Duration,
         pub probe_interval: Duration,
         pub probe_timeout: Duration,
         pub min_latency_samples: usize,
+        pub trials: usize,
+        pub csv_path: Option<String>,
+        pub json_path: Option<String>,
     }
 
     impl Default for BenchConfig {
@@ -27,6 +30,9 @@ mod linux {
                 probe_interval: Duration::from_millis(2),
                 probe_timeout: Duration::from_millis(25),
                 min_latency_samples: 10,
+                trials: 1,
+                csv_path: None,
+                json_path: None,
             }
         }
     }
@@ -57,6 +63,23 @@ mod linux {
             if let Ok(v) = std::env::var("UDP_BENCH_MIN_SAMPLES") {
                 if let Ok(n) = v.parse::<usize>() {
                     cfg.min_latency_samples = n;
+                }
+            }
+            if let Ok(v) = std::env::var("UDP_BENCH_TRIALS") {
+                if let Ok(n) = v.parse::<usize>() {
+                    if n > 0 {
+                        cfg.trials = n;
+                    }
+                }
+            }
+            if let Ok(path) = std::env::var("UDP_BENCH_CSV") {
+                if !path.trim().is_empty() {
+                    cfg.csv_path = Some(path);
+                }
+            }
+            if let Ok(path) = std::env::var("UDP_BENCH_JSON") {
+                if !path.trim().is_empty() {
+                    cfg.json_path = Some(path);
                 }
             }
             cfg
@@ -112,6 +135,82 @@ mod linux {
         pub invol_cs: i64,
         pub effective_rcvbuf: usize,
         pub effective_sndbuf: usize,
+    }
+
+    impl BenchResult {
+        pub fn csv_header() -> &'static str {
+            "mode,packet_size,concurrency,elapsed_ms,packets_sent,packets_recv_timed,packets_drained,total_recv,bytes_recv,pps,mbps,cpu_user_pct,cpu_sys_pct,cpu_total_pct,cpu_ns_per_pkt,io_ops_per_pkt,packet_loss_pct,p50_rtt_us,p95_rtt_us,p99_rtt_us,latency_samples,latency_timeouts,latency_invalid,peak_rss_kb\n"
+        }
+
+        pub fn to_csv_row(&self) -> String {
+            let mode_str = match self.mode {
+                Mode::Baseline => "baseline".to_string(),
+                Mode::Grouped(b) => format!("grouped_{b}"),
+                Mode::Batched(b) => format!("batched_{b}"),
+            };
+            format!(
+                "{},{},{},{:.3},{},{},{},{},{},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{},{},{},{},{},{},{}\n",
+                mode_str,
+                self.packet_size,
+                self.concurrency,
+                self.elapsed.as_secs_f64() * 1000.0,
+                self.packets_sent,
+                self.packets_recv_timed,
+                self.packets_drained,
+                self.total_recv,
+                self.bytes_recv,
+                self.pps,
+                self.mbps,
+                self.user_cpu_pct,
+                self.sys_cpu_pct,
+                self.total_cpu_pct,
+                self.cpu_ns_per_pkt,
+                self.io_ops_per_pkt,
+                self.packet_loss_pct,
+                self.p50_rtt_us.map(|v| format!("{v:.2}")).unwrap_or_default(),
+                self.p95_rtt_us.map(|v| format!("{v:.2}")).unwrap_or_default(),
+                self.p99_rtt_us.map(|v| format!("{v:.2}")).unwrap_or_default(),
+                self.latency_samples,
+                self.latency_timeouts,
+                self.latency_invalid,
+                self.peak_rss_kb,
+            )
+        }
+
+        pub fn to_json(&self) -> String {
+            let mode_str = match self.mode {
+                Mode::Baseline => "baseline",
+                Mode::Grouped(b) => &format!("grouped_{b}"),
+                Mode::Batched(b) => &format!("batched_{b}"),
+            };
+            format!(
+                "{{\"mode\":\"{}\",\"packet_size\":{},\"concurrency\":{},\"elapsed_ms\":{:.3},\"packets_sent\":{},\"packets_recv_timed\":{},\"packets_drained\":{},\"total_recv\":{},\"bytes_recv\":{},\"pps\":{:.2},\"mbps\":{:.2},\"cpu_user_pct\":{:.2},\"cpu_sys_pct\":{:.2},\"cpu_total_pct\":{:.2},\"cpu_ns_per_pkt\":{:.2},\"io_ops_per_pkt\":{:.2},\"packet_loss_pct\":{:.2},\"p50_rtt_us\":{},\"p95_rtt_us\":{},\"p99_rtt_us\":{},\"latency_samples\":{},\"latency_timeouts\":{},\"latency_invalid\":{},\"peak_rss_kb\":{}}}",
+                mode_str,
+                self.packet_size,
+                self.concurrency,
+                self.elapsed.as_secs_f64() * 1000.0,
+                self.packets_sent,
+                self.packets_recv_timed,
+                self.packets_drained,
+                self.total_recv,
+                self.bytes_recv,
+                self.pps,
+                self.mbps,
+                self.user_cpu_pct,
+                self.sys_cpu_pct,
+                self.total_cpu_pct,
+                self.cpu_ns_per_pkt,
+                self.io_ops_per_pkt,
+                self.packet_loss_pct,
+                self.p50_rtt_us.map(|v| format!("{v:.2}")).unwrap_or_else(|| "null".to_string()),
+                self.p95_rtt_us.map(|v| format!("{v:.2}")).unwrap_or_else(|| "null".to_string()),
+                self.p99_rtt_us.map(|v| format!("{v:.2}")).unwrap_or_else(|| "null".to_string()),
+                self.latency_samples,
+                self.latency_timeouts,
+                self.latency_invalid,
+                self.peak_rss_kb,
+            )
+        }
     }
 
     fn get_rusage() -> libc::rusage {
@@ -682,6 +781,30 @@ mod linux {
         })
     }
 
+    pub async fn run_bench(
+        mode: Mode,
+        packet_size: usize,
+        concurrency: usize,
+        config: &BenchConfig,
+    ) -> io::Result<BenchResult> {
+        if config.trials <= 1 {
+            return run_throughput_bench(mode, packet_size, concurrency, config).await;
+        }
+
+        let mut results = Vec::with_capacity(config.trials);
+        for _ in 0..config.trials {
+            let res = run_throughput_bench(mode, packet_size, concurrency, config).await?;
+            results.push(res);
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        results.sort_by(|a, b| {
+            a.pps
+                .partial_cmp(&b.pps)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        Ok(results[results.len() / 2].clone())
+    }
+
     fn print_header() {
         println!(
         "| Mode | PktSz | Conc | Pkts/sec | MByte/s | CPU% (U+S) | CPU-ns/Pkt | IO-Ops/Pkt | Loss % | p50 (us) | p95 (us) | p99 (us) | Pings (TO) | Peak RSS |"
@@ -760,9 +883,18 @@ mod linux {
         println!();
 
         let config = BenchConfig::from_env();
+        if config.trials > 1 {
+            println!(
+                "Running with {} trials per benchmark case (reporting median).",
+                config.trials
+            );
+            println!();
+        }
+
         let packet_sizes = [64, 512, 1200, 1472];
         let concurrencies = [1, 4, 16, 64];
         let batch_sizes = [4, 8, 16, 32, 64];
+        let mut all_results = Vec::new();
 
         // Section 1: Baseline Tokio across all Packet Sizes and Concurrencies
         println!(
@@ -771,8 +903,9 @@ mod linux {
         print_header();
         for &pkt in &packet_sizes {
             for &conc in &concurrencies {
-                let res = run_throughput_bench(Mode::Baseline, pkt, conc, &config).await?;
+                let res = run_bench(Mode::Baseline, pkt, conc, &config).await?;
                 print_result(&res);
+                all_results.push(res);
             }
         }
         println!();
@@ -780,26 +913,32 @@ mod linux {
         // Section 2: Three-Way Comparison: Baseline vs Grouped vs Batched (64B packets, 16x16 concurrency)
         println!("### PART 2: Three-Way Comparison (Packet Size: 64B, Concurrency: 16x16)");
         print_header();
-        let b_res = run_throughput_bench(Mode::Baseline, 64, 16, &config).await?;
+        let b_res = run_bench(Mode::Baseline, 64, 16, &config).await?;
         print_result(&b_res);
+        all_results.push(b_res);
         for &bs in &batch_sizes {
-            let g_res = run_throughput_bench(Mode::Grouped(bs), 64, 16, &config).await?;
+            let g_res = run_bench(Mode::Grouped(bs), 64, 16, &config).await?;
             print_result(&g_res);
-            let res = run_throughput_bench(Mode::Batched(bs), 64, 16, &config).await?;
+            all_results.push(g_res);
+            let res = run_bench(Mode::Batched(bs), 64, 16, &config).await?;
             print_result(&res);
+            all_results.push(res);
         }
         println!();
 
         // Section 3: Three-Way Comparison: Baseline vs Grouped vs Batched (1472B packets, 16x16 concurrency)
         println!("### PART 3: Three-Way Comparison (Packet Size: 1472B, Concurrency: 16x16)");
         print_header();
-        let b_res1472 = run_throughput_bench(Mode::Baseline, 1472, 16, &config).await?;
+        let b_res1472 = run_bench(Mode::Baseline, 1472, 16, &config).await?;
         print_result(&b_res1472);
+        all_results.push(b_res1472);
         for &bs in &batch_sizes {
-            let g_res = run_throughput_bench(Mode::Grouped(bs), 1472, 16, &config).await?;
+            let g_res = run_bench(Mode::Grouped(bs), 1472, 16, &config).await?;
             print_result(&g_res);
-            let res = run_throughput_bench(Mode::Batched(bs), 1472, 16, &config).await?;
+            all_results.push(g_res);
+            let res = run_bench(Mode::Batched(bs), 1472, 16, &config).await?;
             print_result(&res);
+            all_results.push(res);
         }
         println!();
 
@@ -809,12 +948,15 @@ mod linux {
         );
         print_header();
         for &conc in &concurrencies {
-            let b = run_throughput_bench(Mode::Baseline, 64, conc, &config).await?;
+            let b = run_bench(Mode::Baseline, 64, conc, &config).await?;
             print_result(&b);
-            let g = run_throughput_bench(Mode::Grouped(32), 64, conc, &config).await?;
+            all_results.push(b);
+            let g = run_bench(Mode::Grouped(32), 64, conc, &config).await?;
             print_result(&g);
-            let batched = run_throughput_bench(Mode::Batched(32), 64, conc, &config).await?;
+            all_results.push(g);
+            let batched = run_bench(Mode::Batched(32), 64, conc, &config).await?;
             print_result(&batched);
+            all_results.push(batched);
         }
         println!();
 
@@ -824,14 +966,39 @@ mod linux {
     );
         print_header();
         for &conc in &concurrencies {
-            let b = run_throughput_bench(Mode::Baseline, 1472, conc, &config).await?;
+            let b = run_bench(Mode::Baseline, 1472, conc, &config).await?;
             print_result(&b);
-            let g = run_throughput_bench(Mode::Grouped(32), 1472, conc, &config).await?;
+            all_results.push(b);
+            let g = run_bench(Mode::Grouped(32), 1472, conc, &config).await?;
             print_result(&g);
-            let batched = run_throughput_bench(Mode::Batched(32), 1472, conc, &config).await?;
+            all_results.push(g);
+            let batched = run_bench(Mode::Batched(32), 1472, conc, &config).await?;
             print_result(&batched);
+            all_results.push(batched);
         }
         println!();
+
+        if let Some(path) = &config.csv_path {
+            let mut content = String::from(BenchResult::csv_header());
+            for r in &all_results {
+                content.push_str(&r.to_csv_row());
+            }
+            std::fs::write(path, content)?;
+            println!(
+                "Exported {} benchmark results to CSV: {path}",
+                all_results.len()
+            );
+        }
+
+        if let Some(path) = &config.json_path {
+            let json_rows: Vec<String> = all_results.iter().map(|r| r.to_json()).collect();
+            let json_content = format!("[\n  {}\n]\n", json_rows.join(",\n  "));
+            std::fs::write(path, json_content)?;
+            println!(
+                "Exported {} benchmark results to JSON: {path}",
+                all_results.len()
+            );
+        }
 
         println!("Benchmark execution completed successfully.");
         Ok(())
