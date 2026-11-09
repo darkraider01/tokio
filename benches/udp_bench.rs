@@ -213,11 +213,14 @@ mod linux {
         }
     }
 
-    fn get_rusage() -> libc::rusage {
+    fn get_rusage() -> io::Result<libc::rusage> {
         unsafe {
             let mut r = std::mem::MaybeUninit::<libc::rusage>::zeroed();
-            libc::getrusage(libc::RUSAGE_SELF, r.as_mut_ptr());
-            r.assume_init()
+            let ret = libc::getrusage(libc::RUSAGE_SELF, r.as_mut_ptr());
+            if ret != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(r.assume_init())
         }
     }
 
@@ -588,12 +591,12 @@ mod linux {
         // Synchronize workers so all tasks release simultaneously at the start of measurement
         start_barrier.wait().await;
         let start_time = Instant::now();
-        let rusage_start = get_rusage();
+        let rusage_start = get_rusage()?;
 
         // Run measurement duration
         tokio::time::sleep(config.duration).await;
         let measurement_stop_time = Instant::now();
-        let rusage_stop = get_rusage();
+        let rusage_stop = get_rusage()?;
         let actual_measurement_duration = measurement_stop_time.duration_since(start_time);
 
         // Signal cooperative shutdown to both senders and receivers simultaneously
