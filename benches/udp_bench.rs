@@ -394,6 +394,17 @@ mod linux {
         pub raw_trials: Vec<TrialResult>,
     }
 
+    fn calc_median(vals: &mut [f64]) -> f64 {
+        assert!(!vals.is_empty(), "vals must not be empty");
+        vals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let n = vals.len();
+        if n % 2 == 1 {
+            vals[n / 2]
+        } else {
+            (vals[n / 2 - 1] + vals[n / 2]) / 2.0
+        }
+    }
+
     impl BenchSummary {
         pub fn from_trials(trials: Vec<TrialResult>) -> Self {
             assert!(!trials.is_empty(), "trials must not be empty");
@@ -409,11 +420,8 @@ mod linux {
                     .unwrap_or(std::cmp::Ordering::Equal)
             });
 
-            let median_pps = if n % 2 == 1 {
-                sorted_by_pps[n / 2].pps
-            } else {
-                (sorted_by_pps[n / 2 - 1].pps + sorted_by_pps[n / 2].pps) / 2.0
-            };
+            let mut pps_vals: Vec<f64> = trials.iter().map(|t| t.pps).collect();
+            let median_pps = calc_median(&mut pps_vals);
             let min_pps = sorted_by_pps[0].pps;
             let max_pps = sorted_by_pps[n - 1].pps;
 
@@ -427,38 +435,33 @@ mod linux {
             let stddev_pps = var_pps.sqrt();
 
             let mut sorted_mib: Vec<f64> = trials.iter().map(|t| t.mib_per_sec).collect();
-            sorted_mib.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-            let median_mib_per_sec = sorted_mib[n / 2];
+            let median_mib_per_sec = calc_median(&mut sorted_mib);
             let mean_mib_per_sec = trials.iter().map(|t| t.mib_per_sec).sum::<f64>() / (n as f64);
 
+            let mut sorted_total_cpu: Vec<f64> = trials.iter().map(|t| t.total_cpu_pct).collect();
+            let median_cpu_pct = calc_median(&mut sorted_total_cpu);
+            let mean_cpu_pct = trials.iter().map(|t| t.total_cpu_pct).sum::<f64>() / (n as f64);
+
             let mut sorted_user_cpu: Vec<f64> = trials.iter().map(|t| t.user_cpu_pct).collect();
-            sorted_user_cpu.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-            let median_user_cpu_pct = sorted_user_cpu[n / 2];
+            let median_user_cpu_pct = calc_median(&mut sorted_user_cpu);
             let mean_user_cpu_pct = trials.iter().map(|t| t.user_cpu_pct).sum::<f64>() / (n as f64);
 
             let mut sorted_sys_cpu: Vec<f64> = trials.iter().map(|t| t.sys_cpu_pct).collect();
-            sorted_sys_cpu.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-            let median_sys_cpu_pct = sorted_sys_cpu[n / 2];
+            let median_sys_cpu_pct = calc_median(&mut sorted_sys_cpu);
             let mean_sys_cpu_pct = trials.iter().map(|t| t.sys_cpu_pct).sum::<f64>() / (n as f64);
 
-            let median_cpu_pct = median_user_cpu_pct + median_sys_cpu_pct;
-            let mean_cpu_pct = mean_user_cpu_pct + mean_sys_cpu_pct;
-
             let mut sorted_cpu_ns: Vec<f64> = trials.iter().map(|t| t.cpu_ns_per_pkt).collect();
-            sorted_cpu_ns.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-            let median_cpu_ns_per_pkt = sorted_cpu_ns[n / 2];
+            let median_cpu_ns_per_pkt = calc_median(&mut sorted_cpu_ns);
             let mean_cpu_ns_per_pkt =
                 trials.iter().map(|t| t.cpu_ns_per_pkt).sum::<f64>() / (n as f64);
 
             let mut sorted_io_ops: Vec<f64> = trials.iter().map(|t| t.io_ops_per_pkt).collect();
-            sorted_io_ops.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-            let median_io_ops_per_pkt = sorted_io_ops[n / 2];
+            let median_io_ops_per_pkt = calc_median(&mut sorted_io_ops);
             let mean_io_ops_per_pkt =
                 trials.iter().map(|t| t.io_ops_per_pkt).sum::<f64>() / (n as f64);
 
             let mut sorted_loss: Vec<f64> = trials.iter().map(|t| t.packet_loss_pct).collect();
-            sorted_loss.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-            let median_loss_pct = sorted_loss[n / 2];
+            let median_loss_pct = calc_median(&mut sorted_loss);
             let mean_loss_pct = trials.iter().map(|t| t.packet_loss_pct).sum::<f64>() / (n as f64);
 
             let calc_median_opt = |extract: fn(&TrialResult) -> Option<f64>| -> Option<f64> {
@@ -466,8 +469,7 @@ mod linux {
                 if vals.is_empty() {
                     None
                 } else {
-                    vals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-                    Some(vals[vals.len() / 2])
+                    Some(calc_median(&mut vals))
                 }
             };
 
@@ -1316,7 +1318,7 @@ mod linux {
 
     fn print_header() {
         println!(
-        "| Mode | PktSz | Conc | Pkts/sec |  MiB/s  | CPU% (U+S) | CPU-ns/Pkt | IO-Ops/Pkt | Loss % | p50 (us) | p95 (us) | p99 (us) | Pings (TO) | Peak RSS |"
+        "| Mode | PktSz | Conc | Pkts/sec |  MiB/s  | CPU% Tot(U/S) | CPU-ns/Pkt | IO-Ops/Pkt | Loss % | p50 (us) | p95 (us) | p99 (us) | Pings (TO) | Peak RSS |"
     );
         println!(
             "|:---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|"
@@ -1351,7 +1353,7 @@ mod linux {
             None => "     N/A".to_string(),
         };
         println!(
-            "| {:<10} | {:>5} | {:>4} | {:>10.0} | {:>7.2} | {:>5.1}% ({:>4.1}+{:<4.1}) | {:>10.0} | {:>12.2} | {:>5.2}% | {} | {} | {} | {:>10} | {:>7} KB |",
+            "| {:<10} | {:>5} | {:>4} | {:>10.0} | {:>7.2} | {:>5.1}% ({:>4.1}/{:<4.1}) | {:>10.0} | {:>12.2} | {:>5.2}% | {} | {} | {} | {:>10} | {:>7} KB |",
             mode_str,
             r.packet_size,
             r.concurrency,
@@ -1873,7 +1875,8 @@ mod linux {
                 (s1.median_cpu_pct - (s1.median_user_cpu_pct + s1.median_sys_cpu_pct)).abs() < 1e-9
             );
 
-            // Case 2: Multi-trial with varying user and system percentages
+            // Case 2: Multi-trial (odd count) with varying user and system percentages
+            // Demonstrates that median(total) != median(user) + median(sys)
             let trials = vec![
                 make_trial(0, 9000.0, 30.0, 110.0),
                 make_trial(1, 10000.0, 45.0, 95.0),
@@ -1882,16 +1885,32 @@ mod linux {
             let s_multi = BenchSummary::from_trials(trials);
             assert_eq!(s_multi.median_user_cpu_pct, 40.0);
             assert_eq!(s_multi.median_sys_cpu_pct, 110.0);
-            assert_eq!(s_multi.median_cpu_pct, 150.0);
+            assert_eq!(s_multi.median_cpu_pct, 140.0);
             assert!(
                 (s_multi.median_cpu_pct
                     - (s_multi.median_user_cpu_pct + s_multi.median_sys_cpu_pct))
                     .abs()
-                    < 1e-9
+                    > 1.0
             );
             assert!(
                 (s_multi.mean_cpu_pct - (s_multi.mean_user_cpu_pct + s_multi.mean_sys_cpu_pct))
                     .abs()
+                    < 1e-9
+            );
+
+            // Case 3: Even number of trials testing averaged median
+            let even_trials = vec![
+                make_trial(0, 8000.0, 20.0, 80.0),
+                make_trial(1, 9000.0, 30.0, 90.0),
+                make_trial(2, 10000.0, 40.0, 100.0),
+                make_trial(3, 11000.0, 50.0, 110.0),
+            ];
+            let s_even = BenchSummary::from_trials(even_trials);
+            assert_eq!(s_even.median_user_cpu_pct, 35.0);
+            assert_eq!(s_even.median_sys_cpu_pct, 95.0);
+            assert_eq!(s_even.median_cpu_pct, 130.0);
+            assert!(
+                (s_even.mean_cpu_pct - (s_even.mean_user_cpu_pct + s_even.mean_sys_cpu_pct)).abs()
                     < 1e-9
             );
         }
