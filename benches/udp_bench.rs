@@ -1091,7 +1091,7 @@ mod linux {
             }
         }
         let recv_stop_time = Instant::now();
-        let receiver_completion_duration = recv_stop_time.duration_since(send_stop_time);
+        let receiver_completion_duration = recv_stop_time.duration_since(nominal_stop_time);
 
         // Phase 4: Wait for latency probe task to terminate and abort echo server
         let join_timeout = config.probe_timeout + Duration::from_millis(500);
@@ -1629,6 +1629,7 @@ mod linux {
             test_zero_duration_safe_handling();
             test_packet_accounting_trinity().await;
             test_compatible_intervals().await;
+            test_completion_throughput_interval().await;
             test_mode_protocol_parity().await;
             test_shutdown_delay_immunity().await;
             test_cpu_reporting_consistency();
@@ -1818,6 +1819,42 @@ mod linux {
                 assert!(
                     res.pps >= diluted_pps,
                     "steady-state PPS must not be diluted by shutdown/join duration"
+                );
+            }
+        }
+
+        async fn test_completion_throughput_interval() {
+            let config = BenchConfig {
+                duration: Duration::from_millis(50),
+                warmup_duration: Duration::from_millis(10),
+                probe_interval: Duration::from_millis(2),
+                probe_timeout: Duration::from_millis(10),
+                min_latency_samples: 1,
+                trials: 1,
+                seed: 42424,
+                csv_path: None,
+                json_path: None,
+            };
+            let res = run_throughput_bench(Mode::Baseline, 64, 2, 0, &config)
+                .await
+                .expect("trial should succeed");
+
+            // Receiver completion starts at nominal stop and concludes after senders terminate and receivers exit
+            assert!(
+                res.receiver_completion_duration >= res.sender_shutdown_duration,
+                "receiver completion duration ({:?}) must span at least sender shutdown ({:?})",
+                res.receiver_completion_duration,
+                res.sender_shutdown_duration,
+            );
+            let comp_sec = res.receiver_completion_duration.as_secs_f64();
+            if comp_sec > 0.0 {
+                let expected_comp_pps = (res.packets_recv_completion as f64) / comp_sec;
+                assert!(
+                    (res.completion_pps - expected_comp_pps).abs() < 1e-6,
+                    "completion_pps ({}) must be packets_recv_completion ({}) divided by receiver_completion_duration ({})",
+                    res.completion_pps,
+                    res.packets_recv_completion,
+                    comp_sec,
                 );
             }
         }
