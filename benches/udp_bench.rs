@@ -193,6 +193,7 @@ mod linux {
         pub steady_io_ops: u64,
         pub completion_packets: u64,
         pub completion_io_ops: u64,
+        pub stop_observed_at: Option<Instant>,
     }
 
     #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -201,6 +202,7 @@ mod linux {
         pub steady_io_ops: u64,
         pub completion_packets: u64,
         pub completion_io_ops: u64,
+        pub stop_observed_at: Option<Instant>,
     }
 
     #[allow(dead_code)]
@@ -267,11 +269,19 @@ mod linux {
         pub invol_cs: i64,
         pub effective_rcvbuf: usize,
         pub effective_sndbuf: usize,
+        /// Minimum delay between nominal stop broadcast and worker counter freeze across all workers, in microseconds.
+        pub min_stop_skew_us: f64,
+        /// Median delay between nominal stop broadcast and worker counter freeze across all workers, in microseconds.
+        pub median_stop_skew_us: f64,
+        /// Maximum delay between nominal stop broadcast and worker counter freeze across all workers, in microseconds.
+        pub max_stop_skew_us: f64,
+        /// Maximum stop skew expressed as a percentage of the nominal steady-state measurement interval.
+        pub max_stop_skew_pct: f64,
     }
 
     impl TrialResult {
         pub fn csv_header() -> &'static str {
-            "trial_index,mode,packet_size,concurrency,batch_size,nominal_duration_ms,steady_duration_ms,elapsed_ms,sender_shutdown_duration_ms,receiver_completion_duration_ms,packets_sent,packets_recv_steady,packets_recv_completion,packets_recv_timed,packets_drained,total_recv,bytes_recv,pps,completion_pps,mib_per_sec,cpu_user_pct,cpu_sys_pct,cpu_total_pct,cpu_ns_per_pkt,io_ops_per_pkt,packet_loss_pct,p50_rtt_us,p95_rtt_us,p99_rtt_us,latency_samples,latency_timeouts,latency_invalid,peak_rss_kb\n"
+            "trial_index,mode,packet_size,concurrency,batch_size,nominal_duration_ms,steady_duration_ms,elapsed_ms,sender_shutdown_duration_ms,receiver_completion_duration_ms,packets_sent,packets_recv_steady,packets_recv_completion,packets_recv_timed,packets_drained,total_recv,bytes_recv,pps,completion_pps,mib_per_sec,cpu_user_pct,cpu_sys_pct,cpu_total_pct,cpu_ns_per_pkt,io_ops_per_pkt,packet_loss_pct,p50_rtt_us,p95_rtt_us,p99_rtt_us,latency_samples,latency_timeouts,latency_invalid,peak_rss_kb,min_stop_skew_us,median_stop_skew_us,max_stop_skew_us,max_stop_skew_pct\n"
         }
 
         pub fn to_csv_row(&self) -> String {
@@ -281,7 +291,7 @@ mod linux {
                 Mode::Batched(b) => format!("batched_{b}"),
             };
             format!(
-                "{},{},{},{},{},{:.3},{:.3},{:.3},{:.3},{:.3},{},{},{},{},{},{},{},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{},{},{},{},{},{},{}\n",
+                "{},{},{},{},{},{:.3},{:.3},{:.3},{:.3},{:.3},{},{},{},{},{},{},{},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{},{},{},{},{},{},{},{:.2},{:.2},{:.2},{:.4}\n",
                 self.trial_index,
                 mode_str,
                 self.packet_size,
@@ -315,6 +325,10 @@ mod linux {
                 self.latency_timeouts,
                 self.latency_invalid,
                 self.peak_rss_kb,
+                self.min_stop_skew_us,
+                self.median_stop_skew_us,
+                self.max_stop_skew_us,
+                self.max_stop_skew_pct,
             )
         }
 
@@ -325,7 +339,7 @@ mod linux {
                 Mode::Batched(b) => &format!("batched_{b}"),
             };
             format!(
-                "{{\"trial_index\":{},\"mode\":\"{}\",\"packet_size\":{},\"concurrency\":{},\"batch_size\":{},\"nominal_duration_ms\":{:.3},\"steady_duration_ms\":{:.3},\"elapsed_ms\":{:.3},\"sender_shutdown_duration_ms\":{:.3},\"receiver_completion_duration_ms\":{:.3},\"packets_sent\":{},\"packets_recv_steady\":{},\"packets_recv_completion\":{},\"packets_recv_timed\":{},\"packets_drained\":{},\"total_recv\":{},\"bytes_recv\":{},\"pps\":{:.2},\"completion_pps\":{:.2},\"mib_per_sec\":{:.2},\"cpu_user_pct\":{:.2},\"cpu_sys_pct\":{:.2},\"cpu_total_pct\":{:.2},\"cpu_ns_per_pkt\":{:.2},\"io_ops_per_pkt\":{:.2},\"packet_loss_pct\":{:.2},\"p50_rtt_us\":{},\"p95_rtt_us\":{},\"p99_rtt_us\":{},\"latency_samples\":{},\"latency_timeouts\":{},\"latency_invalid\":{},\"peak_rss_kb\":{}}}",
+                "{{\"trial_index\":{},\"mode\":\"{}\",\"packet_size\":{},\"concurrency\":{},\"batch_size\":{},\"nominal_duration_ms\":{:.3},\"steady_duration_ms\":{:.3},\"elapsed_ms\":{:.3},\"sender_shutdown_duration_ms\":{:.3},\"receiver_completion_duration_ms\":{:.3},\"packets_sent\":{},\"packets_recv_steady\":{},\"packets_recv_completion\":{},\"packets_recv_timed\":{},\"packets_drained\":{},\"total_recv\":{},\"bytes_recv\":{},\"pps\":{:.2},\"completion_pps\":{:.2},\"mib_per_sec\":{:.2},\"cpu_user_pct\":{:.2},\"cpu_sys_pct\":{:.2},\"cpu_total_pct\":{:.2},\"cpu_ns_per_pkt\":{:.2},\"io_ops_per_pkt\":{:.2},\"packet_loss_pct\":{:.2},\"p50_rtt_us\":{},\"p95_rtt_us\":{},\"p99_rtt_us\":{},\"latency_samples\":{},\"latency_timeouts\":{},\"latency_invalid\":{},\"peak_rss_kb\":{},\"min_stop_skew_us\":{:.2},\"median_stop_skew_us\":{:.2},\"max_stop_skew_us\":{:.2},\"max_stop_skew_pct\":{:.4}}}",
                 self.trial_index,
                 mode_str,
                 self.packet_size,
@@ -359,6 +373,10 @@ mod linux {
                 self.latency_timeouts,
                 self.latency_invalid,
                 self.peak_rss_kb,
+                self.min_stop_skew_us,
+                self.median_stop_skew_us,
+                self.max_stop_skew_us,
+                self.max_stop_skew_pct,
             )
         }
     }
@@ -392,6 +410,9 @@ mod linux {
         pub median_p50_rtt_us: Option<f64>,
         pub median_p95_rtt_us: Option<f64>,
         pub median_p99_rtt_us: Option<f64>,
+        pub median_stop_skew_us: f64,
+        pub max_stop_skew_us: f64,
+        pub max_stop_skew_pct: f64,
         pub representative: TrialResult,
         pub raw_trials: Vec<TrialResult>,
     }
@@ -479,6 +500,17 @@ mod linux {
             let median_p95_rtt_us = calc_median_opt(|t| t.p95_rtt_us);
             let median_p99_rtt_us = calc_median_opt(|t| t.p99_rtt_us);
 
+            let mut skews: Vec<f64> = trials.iter().map(|t| t.median_stop_skew_us).collect();
+            let median_stop_skew_us = calc_median(&mut skews);
+            let max_stop_skew_us = trials
+                .iter()
+                .map(|t| t.max_stop_skew_us)
+                .fold(0.0, f64::max);
+            let max_stop_skew_pct = trials
+                .iter()
+                .map(|t| t.max_stop_skew_pct)
+                .fold(0.0, f64::max);
+
             let representative = sorted_by_pps[n / 2].clone();
 
             Self {
@@ -508,6 +540,9 @@ mod linux {
                 median_p50_rtt_us,
                 median_p95_rtt_us,
                 median_p99_rtt_us,
+                median_stop_skew_us,
+                max_stop_skew_us,
+                max_stop_skew_pct,
                 representative,
                 raw_trials: trials,
             }
@@ -521,7 +556,7 @@ mod linux {
             };
             let trials_json: Vec<String> = self.raw_trials.iter().map(|t| t.to_json()).collect();
             format!(
-                "{{\"mode\":\"{}\",\"packet_size\":{},\"concurrency\":{},\"trials\":{},\"median_pps\":{:.2},\"mean_pps\":{:.2},\"stddev_pps\":{:.2},\"min_pps\":{:.2},\"max_pps\":{:.2},\"median_mib_per_sec\":{:.2},\"median_cpu_pct\":{:.2},\"median_user_cpu_pct\":{:.2},\"median_sys_cpu_pct\":{:.2},\"median_cpu_ns_per_pkt\":{:.2},\"median_io_ops_per_pkt\":{:.2},\"median_loss_pct\":{:.2},\"median_p50_rtt_us\":{},\"median_p95_rtt_us\":{},\"median_p99_rtt_us\":{},\"raw_trials\":[\n    {}\n  ]}}",
+                "{{\"mode\":\"{}\",\"packet_size\":{},\"concurrency\":{},\"trials\":{},\"median_pps\":{:.2},\"mean_pps\":{:.2},\"stddev_pps\":{:.2},\"min_pps\":{:.2},\"max_pps\":{:.2},\"median_mib_per_sec\":{:.2},\"median_cpu_pct\":{:.2},\"median_user_cpu_pct\":{:.2},\"median_sys_cpu_pct\":{:.2},\"median_cpu_ns_per_pkt\":{:.2},\"median_io_ops_per_pkt\":{:.2},\"median_loss_pct\":{:.2},\"median_p50_rtt_us\":{},\"median_p95_rtt_us\":{},\"median_p99_rtt_us\":{},\"median_stop_skew_us\":{:.2},\"max_stop_skew_us\":{:.2},\"max_stop_skew_pct\":{:.4},\"raw_trials\":[\n    {}\n  ]}}",
                 mode_str,
                 self.packet_size,
                 self.concurrency,
@@ -541,6 +576,9 @@ mod linux {
                 self.median_p50_rtt_us.map(|v| format!("{v:.2}")).unwrap_or_else(|| "null".to_string()),
                 self.median_p95_rtt_us.map(|v| format!("{v:.2}")).unwrap_or_else(|| "null".to_string()),
                 self.median_p99_rtt_us.map(|v| format!("{v:.2}")).unwrap_or_else(|| "null".to_string()),
+                self.median_stop_skew_us,
+                self.max_stop_skew_us,
+                self.max_stop_skew_pct,
                 trials_json.join(",\n    ")
             )
         }
@@ -747,6 +785,7 @@ mod linux {
                                 }
                             }
                         }
+                        let stop_observed_at = Instant::now();
                         // Phase 3: Completion / in-flight drain until sender shutdown completes
                         loop {
                             tokio::select! {
@@ -759,6 +798,13 @@ mod linux {
                                 }
                             }
                         }
+                        Ok(ReceiverStats {
+                            steady_packets,
+                            steady_io_ops,
+                            completion_packets,
+                            completion_io_ops,
+                            stop_observed_at: Some(stop_observed_at),
+                        })
                     }
                     Mode::Grouped(batch_size) => {
                         let mut buf = vec![0u8; packet_size + 64];
@@ -787,6 +833,7 @@ mod linux {
                                 }
                             }
                         }
+                        let stop_observed_at = Instant::now();
                         // Phase 3: Completion / in-flight drain until sender shutdown completes
                         'completion_grouped: loop {
                             tokio::select! {
@@ -812,6 +859,13 @@ mod linux {
                                 }
                             }
                         }
+                        Ok(ReceiverStats {
+                            steady_packets,
+                            steady_io_ops,
+                            completion_packets,
+                            completion_io_ops,
+                            stop_observed_at: Some(stop_observed_at),
+                        })
                     }
                     Mode::Batched(batch_size) => {
                         let mut raw_buffers = vec![vec![0u8; packet_size + 64]; batch_size];
@@ -832,6 +886,7 @@ mod linux {
                                 }
                             }
                         }
+                        let stop_observed_at = Instant::now();
                         // Phase 3: Completion / in-flight drain until sender shutdown completes
                         loop {
                             tokio::select! {
@@ -845,14 +900,15 @@ mod linux {
                                 }
                             }
                         }
+                        Ok(ReceiverStats {
+                            steady_packets,
+                            steady_io_ops,
+                            completion_packets,
+                            completion_io_ops,
+                            stop_observed_at: Some(stop_observed_at),
+                        })
                     }
                 }
-                Ok(ReceiverStats {
-                    steady_packets,
-                    steady_io_ops,
-                    completion_packets,
-                    completion_io_ops,
-                })
             }));
         }
 
@@ -887,12 +943,20 @@ mod linux {
                                 }
                             }
                         }
+                        let stop_observed_at = Instant::now();
                         // Phase 3: Post-stop completion sends before shutdown completes
                         while run.load(Ordering::Relaxed) {
                             s.send_to(&payload, target).await?;
                             completion_packets += 1;
                             completion_io_ops += 1;
                         }
+                        Ok(SenderStats {
+                            steady_packets,
+                            steady_io_ops,
+                            completion_packets,
+                            completion_io_ops,
+                            stop_observed_at: Some(stop_observed_at),
+                        })
                     }
                     Mode::Grouped(batch_size) => {
                         let payload = vec![0x42u8; packet_size];
@@ -921,6 +985,7 @@ mod linux {
                                 }
                             }
                         }
+                        let stop_observed_at = Instant::now();
                         // Phase 3: Post-stop completion sends before shutdown completes
                         while run.load(Ordering::Relaxed) {
                             s.writable().await?;
@@ -940,6 +1005,13 @@ mod linux {
                             }
                             tokio::task::yield_now().await;
                         }
+                        Ok(SenderStats {
+                            steady_packets,
+                            steady_io_ops,
+                            completion_packets,
+                            completion_io_ops,
+                            stop_observed_at: Some(stop_observed_at),
+                        })
                     }
                     Mode::Batched(batch_size) => {
                         let payload = vec![0x42u8; packet_size];
@@ -959,6 +1031,7 @@ mod linux {
                                 }
                             }
                         }
+                        let stop_observed_at = Instant::now();
                         // Phase 3: Post-stop completion sends before shutdown completes
                         while run.load(Ordering::Relaxed) {
                             let n = s.send_many(&batch).await?;
@@ -966,14 +1039,15 @@ mod linux {
                             completion_io_ops += 1;
                             tokio::task::yield_now().await;
                         }
+                        Ok(SenderStats {
+                            steady_packets,
+                            steady_io_ops,
+                            completion_packets,
+                            completion_io_ops,
+                            stop_observed_at: Some(stop_observed_at),
+                        })
                     }
                 }
-                Ok(SenderStats {
-                    steady_packets,
-                    steady_io_ops,
-                    completion_packets,
-                    completion_io_ops,
-                })
             }));
         }
 
@@ -1091,6 +1165,7 @@ mod linux {
         let mut completion_sent = 0u64;
         let mut _completion_send_io_ops = 0u64;
         let mut worker_error = None;
+        let mut stop_skews_us = Vec::with_capacity(concurrency * 2);
 
         for (i, h) in send_handles.into_iter().enumerate() {
             match h.await {
@@ -1099,6 +1174,10 @@ mod linux {
                     steady_send_io_ops += stats.steady_io_ops;
                     completion_sent += stats.completion_packets;
                     _completion_send_io_ops += stats.completion_io_ops;
+                    if let Some(t) = stats.stop_observed_at {
+                        let skew = t.saturating_duration_since(nominal_stop_time);
+                        stop_skews_us.push(skew.as_micros() as f64);
+                    }
                 }
                 Ok(Err(e)) => {
                     if worker_error.is_none() {
@@ -1137,6 +1216,10 @@ mod linux {
                     steady_recv_io_ops += stats.steady_io_ops;
                     completion_recv += stats.completion_packets;
                     _completion_recv_io_ops += stats.completion_io_ops;
+                    if let Some(t) = stats.stop_observed_at {
+                        let skew = t.saturating_duration_since(nominal_stop_time);
+                        stop_skews_us.push(skew.as_micros() as f64);
+                    }
                 }
                 Ok(Err(e)) => {
                     if worker_error.is_none() {
@@ -1158,6 +1241,24 @@ mod linux {
         }
         let recv_stop_time = Instant::now();
         let receiver_completion_duration = recv_stop_time.duration_since(nominal_stop_time);
+
+        let (min_stop_skew_us, median_stop_skew_us, max_stop_skew_us, max_stop_skew_pct) =
+            if !stop_skews_us.is_empty() {
+                let mut skews = stop_skews_us.clone();
+                skews.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                let min = skews[0];
+                let max = skews[skews.len() - 1];
+                let median = calc_median(&mut skews);
+                let nominal_us = nominal_duration.as_micros() as f64;
+                let pct = if nominal_us > 0.0 {
+                    (max / nominal_us) * 100.0
+                } else {
+                    0.0
+                };
+                (min, median, max, pct)
+            } else {
+                (0.0, 0.0, 0.0, 0.0)
+            };
 
         // Phase 4: Wait for latency probe task to terminate and abort echo server
         let join_timeout = config.probe_timeout + Duration::from_millis(500);
@@ -1315,6 +1416,10 @@ mod linux {
             invol_cs,
             effective_rcvbuf,
             effective_sndbuf,
+            min_stop_skew_us,
+            median_stop_skew_us,
+            max_stop_skew_us,
+            max_stop_skew_pct,
         })
     }
 
@@ -1697,6 +1802,7 @@ mod linux {
             test_compatible_intervals().await;
             test_completion_throughput_interval().await;
             test_sender_operation_phase_separation().await;
+            test_stop_notification_skew().await;
             test_mode_protocol_parity().await;
             test_shutdown_delay_immunity().await;
             test_cpu_reporting_consistency();
@@ -1743,6 +1849,10 @@ mod linux {
                 invol_cs: 0,
                 effective_rcvbuf: 0,
                 effective_sndbuf: 0,
+                min_stop_skew_us: 0.0,
+                median_stop_skew_us: 0.0,
+                max_stop_skew_us: 0.0,
+                max_stop_skew_pct: 0.0,
             };
             assert!(!tr.pps.is_nan());
             assert!(!tr.mib_per_sec.is_nan());
@@ -1975,6 +2085,46 @@ mod linux {
             );
         }
 
+        async fn test_stop_notification_skew() {
+            let config = BenchConfig {
+                duration: Duration::from_millis(50),
+                warmup_duration: Duration::from_millis(10),
+                probe_interval: Duration::from_millis(2),
+                probe_timeout: Duration::from_millis(10),
+                min_latency_samples: 1,
+                trials: 1,
+                seed: 55555,
+                csv_path: None,
+                json_path: None,
+            };
+
+            let res = run_throughput_bench(Mode::Batched(4), 64, 4, 0, &config)
+                .await
+                .expect("trial should succeed");
+
+            assert!(
+                res.min_stop_skew_us >= 0.0,
+                "min stop skew must be non-negative"
+            );
+            assert!(
+                res.median_stop_skew_us >= res.min_stop_skew_us,
+                "median stop skew must be >= min stop skew"
+            );
+            assert!(
+                res.max_stop_skew_us >= res.median_stop_skew_us,
+                "max stop skew must be >= median stop skew"
+            );
+            assert!(
+                res.max_stop_skew_pct >= 0.0 && res.max_stop_skew_pct <= 100.0,
+                "max stop skew pct must be between 0 and 100%"
+            );
+            assert!(
+                res.max_stop_skew_us < 50_000.0,
+                "max stop skew ({:.2}us) must be less than nominal duration (50000us)",
+                res.max_stop_skew_us
+            );
+        }
+
         fn test_cpu_reporting_consistency() {
             let make_trial = |idx: usize, pps: f64, user: f64, sys: f64| TrialResult {
                 trial_index: idx,
@@ -2016,6 +2166,10 @@ mod linux {
                 invol_cs: 5,
                 effective_rcvbuf: 4096,
                 effective_sndbuf: 4096,
+                min_stop_skew_us: 0.0,
+                median_stop_skew_us: 0.0,
+                max_stop_skew_us: 0.0,
+                max_stop_skew_pct: 0.0,
             };
 
             // Case 1: Single trial
