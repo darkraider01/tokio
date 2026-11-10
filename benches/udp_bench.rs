@@ -743,10 +743,9 @@ mod linux {
                 Ok(Ok(_)) => {}                                    // Clean exit
                 Ok(Err(join_err)) if join_err.is_cancelled() => {} // Expected cancellation
                 Ok(Err(join_err)) => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::Other,
-                        format!("Warmup task {i} panicked: {join_err}"),
-                    ));
+                    return Err(io::Error::other(format!(
+                        "Warmup task {i} panicked: {join_err}"
+                    )));
                 }
                 Err(_) => {
                     return Err(io::Error::new(
@@ -1196,10 +1195,9 @@ mod linux {
                 }
                 Err(e) => {
                     if worker_error.is_none() {
-                        worker_error = Some(io::Error::new(
-                            io::ErrorKind::Other,
-                            format!("Sender task {i} join failure: {e}"),
-                        ));
+                        worker_error = Some(io::Error::other(format!(
+                            "Sender task {i} join failure: {e}"
+                        )));
                     }
                 }
             }
@@ -1238,10 +1236,9 @@ mod linux {
                 }
                 Err(e) => {
                     if worker_error.is_none() {
-                        worker_error = Some(io::Error::new(
-                            io::ErrorKind::Other,
-                            format!("Receiver task {i} join failure: {e}"),
-                        ));
+                        worker_error = Some(io::Error::other(format!(
+                            "Receiver task {i} join failure: {e}"
+                        )));
                     }
                 }
             }
@@ -1274,10 +1271,9 @@ mod linux {
                 Ok(Ok(stats)) => stats,
                 Ok(Err(panic_err)) => {
                     if worker_error.is_none() {
-                        worker_error = Some(io::Error::new(
-                            io::ErrorKind::Other,
-                            format!("Latency probe task panicked: {panic_err}"),
-                        ));
+                        worker_error = Some(io::Error::other(format!(
+                            "Latency probe task panicked: {panic_err}"
+                        )));
                     }
                     (Vec::new(), 0, 0)
                 }
