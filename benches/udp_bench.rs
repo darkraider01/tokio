@@ -189,8 +189,10 @@ mod linux {
 
     #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
     pub struct SenderStats {
-        pub packets: u64,
-        pub io_ops: u64,
+        pub steady_packets: u64,
+        pub steady_io_ops: u64,
+        pub completion_packets: u64,
+        pub completion_io_ops: u64,
     }
 
     #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -854,30 +856,72 @@ mod linux {
             }));
         }
 
-        // Spawn sender tasks with plain local integer counters
+        // Spawn sender tasks with two-phase accounting (steady state then completion drain)
         let mut send_handles = Vec::with_capacity(concurrency);
         for i in 0..concurrency {
             let s = senders[i].clone();
             let target = receiver_addrs[i];
             let run = running.clone();
             let barrier = start_barrier.clone();
+            let mut steady_stop_rx = steady_stop_tx.subscribe();
 
             send_handles.push(tokio::spawn(async move {
                 barrier.wait().await;
-                let mut local_packets = 0u64;
-                let mut local_io_ops = 0u64;
+                let mut steady_packets = 0u64;
+                let mut steady_io_ops = 0u64;
+                let mut completion_packets = 0u64;
+                let mut completion_io_ops = 0u64;
 
                 match mode {
                     Mode::Baseline => {
                         let payload = vec![0x42u8; packet_size];
+                        // Phase 2: Active steady-state measurement window
+                        loop {
+                            tokio::select! {
+                                biased;
+                                _ = steady_stop_rx.changed() => break,
+                                res = s.send_to(&payload, target) => {
+                                    res?;
+                                    steady_packets += 1;
+                                    steady_io_ops += 1;
+                                }
+                            }
+                        }
+                        // Phase 3: Post-stop completion sends before shutdown completes
                         while run.load(Ordering::Relaxed) {
                             s.send_to(&payload, target).await?;
-                            local_packets += 1;
-                            local_io_ops += 1;
+                            completion_packets += 1;
+                            completion_io_ops += 1;
                         }
                     }
                     Mode::Grouped(batch_size) => {
                         let payload = vec![0x42u8; packet_size];
+                        // Phase 2: Active steady-state measurement window
+                        'steady_grouped: loop {
+                            tokio::select! {
+                                biased;
+                                _ = steady_stop_rx.changed() => break 'steady_grouped,
+                                res = s.writable() => {
+                                    res?;
+                                    let mut sent = 0;
+                                    while sent < batch_size && !*steady_stop_rx.borrow() {
+                                        match s.try_send_to(&payload, target) {
+                                            Ok(_) => {
+                                                sent += 1;
+                                                steady_packets += 1;
+                                                steady_io_ops += 1;
+                                            }
+                                            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                                                break;
+                                            }
+                                            Err(e) => return Err(e),
+                                        }
+                                    }
+                                    tokio::task::yield_now().await;
+                                }
+                            }
+                        }
+                        // Phase 3: Post-stop completion sends before shutdown completes
                         while run.load(Ordering::Relaxed) {
                             s.writable().await?;
                             let mut sent = 0;
@@ -885,8 +929,8 @@ mod linux {
                                 match s.try_send_to(&payload, target) {
                                     Ok(_) => {
                                         sent += 1;
-                                        local_packets += 1;
-                                        local_io_ops += 1;
+                                        completion_packets += 1;
+                                        completion_io_ops += 1;
                                     }
                                     Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
                                         break;
@@ -902,17 +946,33 @@ mod linux {
                         let batch: Vec<Datagram<'_>> = (0..batch_size)
                             .map(|_| Datagram::to_addr(&payload, target))
                             .collect();
+                        // Phase 2: Active steady-state measurement window
+                        loop {
+                            tokio::select! {
+                                biased;
+                                _ = steady_stop_rx.changed() => break,
+                                res = s.send_many(&batch) => {
+                                    let n = res?;
+                                    steady_packets += n as u64;
+                                    steady_io_ops += 1;
+                                    tokio::task::yield_now().await;
+                                }
+                            }
+                        }
+                        // Phase 3: Post-stop completion sends before shutdown completes
                         while run.load(Ordering::Relaxed) {
                             let n = s.send_many(&batch).await?;
-                            local_packets += n as u64;
-                            local_io_ops += 1;
+                            completion_packets += n as u64;
+                            completion_io_ops += 1;
                             tokio::task::yield_now().await;
                         }
                     }
                 }
                 Ok(SenderStats {
-                    packets: local_packets,
-                    io_ops: local_io_ops,
+                    steady_packets,
+                    steady_io_ops,
+                    completion_packets,
+                    completion_io_ops,
                 })
             }));
         }
@@ -1026,15 +1086,19 @@ mod linux {
         // 2. Halt sender generation so no new packets enter the network.
         running.store(false, Ordering::Release);
 
-        let mut sent = 0u64;
-        let mut send_io_ops = 0u64;
+        let mut steady_sent = 0u64;
+        let mut steady_send_io_ops = 0u64;
+        let mut completion_sent = 0u64;
+        let mut _completion_send_io_ops = 0u64;
         let mut worker_error = None;
 
         for (i, h) in send_handles.into_iter().enumerate() {
             match h.await {
                 Ok(Ok(stats)) => {
-                    sent += stats.packets;
-                    send_io_ops += stats.io_ops;
+                    steady_sent += stats.steady_packets;
+                    steady_send_io_ops += stats.steady_io_ops;
+                    completion_sent += stats.completion_packets;
+                    _completion_send_io_ops += stats.completion_io_ops;
                 }
                 Ok(Err(e)) => {
                     if worker_error.is_none() {
@@ -1054,6 +1118,8 @@ mod linux {
                 }
             }
         }
+        let sent = steady_sent + completion_sent;
+        let send_io_ops = steady_send_io_ops;
         let send_stop_time = Instant::now();
         let sender_shutdown_duration = send_stop_time.duration_since(nominal_stop_time);
 
@@ -1630,6 +1696,7 @@ mod linux {
             test_packet_accounting_trinity().await;
             test_compatible_intervals().await;
             test_completion_throughput_interval().await;
+            test_sender_operation_phase_separation().await;
             test_mode_protocol_parity().await;
             test_shutdown_delay_immunity().await;
             test_cpu_reporting_consistency();
@@ -1857,6 +1924,55 @@ mod linux {
                     comp_sec,
                 );
             }
+        }
+
+        async fn test_sender_operation_phase_separation() {
+            let config = BenchConfig {
+                duration: Duration::from_millis(50),
+                warmup_duration: Duration::from_millis(10),
+                probe_interval: Duration::from_millis(2),
+                probe_timeout: Duration::from_millis(10),
+                min_latency_samples: 1,
+                trials: 1,
+                seed: 31415,
+                csv_path: None,
+                json_path: None,
+            };
+
+            // Test Baseline: each datagram requires 1 I/O send
+            let res_base = run_throughput_bench(Mode::Baseline, 64, 1, 0, &config)
+                .await
+                .expect("baseline trial should succeed");
+            assert!(res_base.successful_io_sends > 0);
+            assert!(res_base.successful_io_recvs > 0);
+            assert!(res_base.packets_sent >= res_base.successful_io_sends);
+            let expected_io_ops_base = (res_base.successful_io_sends + res_base.successful_io_recvs)
+                as f64
+                / (res_base.packets_recv_steady as f64);
+            assert!(
+                (res_base.io_ops_per_pkt - expected_io_ops_base).abs() < 1e-6,
+                "io_ops_per_pkt must equal (steady_sends + steady_recvs) / steady_recv"
+            );
+
+            // Test Batched(4): sendmmsg transmits multiple datagrams per successful socket operation
+            let res_batch = run_throughput_bench(Mode::Batched(4), 64, 1, 0, &config)
+                .await
+                .expect("batched trial should succeed");
+            assert!(res_batch.successful_io_sends > 0);
+            assert!(res_batch.successful_io_recvs > 0);
+            let pkts_per_send_io =
+                (res_batch.packets_recv_steady as f64) / (res_batch.successful_io_sends as f64);
+            assert!(
+                pkts_per_send_io > 1.0,
+                "batched sendmmsg should achieve > 1.0 datagrams per I/O op (observed: {pkts_per_send_io:.2})"
+            );
+            let expected_io_ops_batch = (res_batch.successful_io_sends
+                + res_batch.successful_io_recvs) as f64
+                / (res_batch.packets_recv_steady as f64);
+            assert!(
+                (res_batch.io_ops_per_pkt - expected_io_ops_batch).abs() < 1e-6,
+                "io_ops_per_pkt must equal (steady_sends + steady_recvs) / steady_recv"
+            );
         }
 
         fn test_cpu_reporting_consistency() {
