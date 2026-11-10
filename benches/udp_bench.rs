@@ -677,6 +677,13 @@ mod linux {
         trial_index: usize,
         config: &BenchConfig,
     ) -> io::Result<TrialResult> {
+        if concurrency == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "concurrency must be greater than 0",
+            ));
+        }
+
         // Sockets setup: `concurrency` pairs of sockets.
         let mut receivers = Vec::with_capacity(concurrency);
         let mut receiver_addrs = Vec::with_capacity(concurrency);
@@ -1545,6 +1552,20 @@ mod linux {
     }
 
     pub async fn run() -> io::Result<()> {
+        let args: Vec<String> = std::env::args().collect();
+        let run_self_tests_only = args.iter().any(|a| a == "--self-test" || a == "-t")
+            || std::env::var("TOKIO_BENCH_SELF_TEST")
+                .map(|v| v == "1")
+                .unwrap_or(false);
+
+        if run_self_tests_only {
+            println!("Running UDP benchmark internal self-tests and validation suite...");
+            config_tests::run_self_tests();
+            measurement_tests::run_self_tests().await;
+            println!("All self-tests passed successfully.");
+            return Ok(());
+        }
+
         println!(
         "========================================================================================="
     );
@@ -1556,8 +1577,6 @@ mod linux {
     );
         let test_sock = UdpSocket::bind("127.0.0.1:0").await?;
         let (eff_rcv, eff_snd) = configure_socket(&test_sock)?;
-        config_tests::run_self_tests();
-        measurement_tests::run_self_tests().await;
         println!(
         "Host: Linux x86_64, local loopback. Effective socket buffers: SO_RCVBUF = {} bytes ({} KB), SO_SNDBUF = {} bytes ({} KB).",
         eff_rcv,
@@ -1803,6 +1822,8 @@ mod linux {
             test_completion_throughput_interval().await;
             test_sender_operation_phase_separation().await;
             test_stop_notification_skew().await;
+            test_phase_transition_isolation().await;
+            test_worker_failure_propagation().await;
             test_mode_protocol_parity().await;
             test_shutdown_delay_immunity().await;
             test_cpu_reporting_consistency();
@@ -2123,6 +2144,99 @@ mod linux {
                 "max stop skew ({:.2}us) must be less than nominal duration (50000us)",
                 res.max_stop_skew_us
             );
+        }
+
+        async fn test_phase_transition_isolation() {
+            // Behavioral proof: datagrams sent after steady_stop notification
+            // are counted as completion_packets, not steady_packets.
+            let (steady_stop_tx, _) = tokio::sync::watch::channel(false);
+            let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+
+            let recv_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+            let target_addr = recv_sock.local_addr().unwrap();
+            let send_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+
+            let mut steady_stop_rx = steady_stop_tx.subscribe();
+            let mut shutdown_rx = shutdown_tx.subscribe();
+            let r_clone = recv_sock.clone();
+
+            let recv_handle = tokio::spawn(async move {
+                let mut buf = [0u8; 128];
+                let mut steady_count = 0u64;
+                let mut completion_count = 0u64;
+
+                // Phase 2: Steady State
+                loop {
+                    tokio::select! {
+                        biased;
+                        _ = steady_stop_rx.changed() => break,
+                        res = r_clone.recv_from(&mut buf) => {
+                            res?;
+                            steady_count += 1;
+                        }
+                    }
+                }
+
+                // Phase 3: Completion / drain
+                loop {
+                    tokio::select! {
+                        biased;
+                        _ = shutdown_rx.changed() => break,
+                        res = r_clone.recv_from(&mut buf) => {
+                            res?;
+                            completion_count += 1;
+                        }
+                    }
+                }
+
+                Ok::<(u64, u64), io::Error>((steady_count, completion_count))
+            });
+
+            // Send 10 packets during steady state
+            for _ in 0..10 {
+                send_sock.send_to(b"steady_pkt", target_addr).await.unwrap();
+            }
+            tokio::time::sleep(Duration::from_millis(15)).await;
+
+            // Signal transition to Phase 3 (steady stop)
+            steady_stop_tx.send(true).unwrap();
+            tokio::time::sleep(Duration::from_millis(5)).await;
+
+            // Send 15 packets during completion phase
+            for _ in 0..15 {
+                send_sock.send_to(b"compl_pkt", target_addr).await.unwrap();
+            }
+            tokio::time::sleep(Duration::from_millis(15)).await;
+
+            // Signal full shutdown
+            shutdown_tx.send(true).unwrap();
+
+            let (steady_count, completion_count) = recv_handle.await.unwrap().unwrap();
+            assert_eq!(
+                steady_count, 10,
+                "exactly 10 packets sent during Phase 2 must be attributed to steady state"
+            );
+            assert_eq!(
+                completion_count, 15,
+                "exactly 15 packets sent during Phase 3 must be attributed to completion"
+            );
+        }
+
+        async fn test_worker_failure_propagation() {
+            let bad_config = BenchConfig {
+                duration: Duration::from_millis(20),
+                warmup_duration: Duration::from_millis(10),
+                probe_interval: Duration::from_millis(2),
+                probe_timeout: Duration::from_millis(10),
+                min_latency_samples: 1,
+                trials: 1,
+                seed: 1,
+                csv_path: None,
+                json_path: None,
+            };
+            // Concurrency 0 must fail validation
+            let res = run_throughput_bench(Mode::Baseline, 64, 0, 0, &bad_config).await;
+            assert!(res.is_err(), "trial with 0 concurrency must return Err");
         }
 
         fn test_cpu_reporting_consistency() {
