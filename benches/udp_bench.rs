@@ -188,6 +188,21 @@ mod linux {
     }
 
     #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+    pub struct SenderStats {
+        pub packets: u64,
+        pub io_ops: u64,
+    }
+
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+    pub struct ReceiverStats {
+        pub steady_packets: u64,
+        pub steady_io_ops: u64,
+        pub completion_packets: u64,
+        pub completion_io_ops: u64,
+    }
+
+    #[allow(dead_code)]
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
     pub struct WorkerStats {
         pub packets: u64,
         pub io_ops: u64,
@@ -203,25 +218,40 @@ mod linux {
         pub batch_size: usize,
         /// Configured nominal measurement duration.
         pub nominal_duration: Duration,
-        /// Actual elapsed duration from start barrier release until all workers have stopped and joined.
+        /// Measured steady-state measurement interval from start barrier release until nominal stop.
+        pub steady_duration: Duration,
+        /// Total elapsed duration from start barrier release until all workers have stopped and joined.
         pub elapsed: Duration,
+        /// Duration taken for senders to observe stop signal and join.
+        pub sender_shutdown_duration: Duration,
+        /// Duration taken for receivers to drain in-flight packets and join.
+        pub receiver_completion_duration: Duration,
         pub packets_sent: u64,
+        /// Datagrams received strictly within the steady-state interval.
+        pub packets_recv_steady: u64,
+        /// Datagrams received during the sender shutdown / in-flight completion phase.
+        pub packets_recv_completion: u64,
+        /// Alias for `packets_recv_steady` for backwards compatibility with existing consumers.
         pub packets_recv_timed: u64,
+        /// Datagrams drained from kernel socket receive buffers post-shutdown.
         pub packets_drained: u64,
         pub total_recv: u64,
         pub bytes_recv: u64,
         /// Number of successful socket I/O operations (sendto or sendmmsg calls).
         pub successful_io_sends: u64,
-        /// Number of successful socket I/O operations (recvfrom or recvmmsg calls).
+        /// Number of successful socket I/O operations in steady state.
         pub successful_io_recvs: u64,
+        /// Steady-state throughput: packets delivered strictly during steady state per second.
         pub pps: f64,
+        /// In-flight completion throughput: packets delivered during sender shutdown per second.
+        pub completion_pps: f64,
         pub mib_per_sec: f64,
         pub user_cpu_pct: f64,
         pub sys_cpu_pct: f64,
         pub total_cpu_pct: f64,
-        /// Aggregate CPU time (user + system) consumed per delivered packet, in nanoseconds.
+        /// Aggregate CPU time (user + system) consumed per delivered packet during steady state, in nanoseconds.
         pub cpu_ns_per_pkt: f64,
-        /// Proxy metric for system call efficiency: successful socket operations per delivered packet.
+        /// Proxy metric for system call efficiency during steady state: socket operations per delivered packet.
         pub io_ops_per_pkt: f64,
         pub packet_loss_pct: f64,
         pub p50_rtt_us: Option<f64>,
@@ -239,7 +269,7 @@ mod linux {
 
     impl TrialResult {
         pub fn csv_header() -> &'static str {
-            "trial_index,mode,packet_size,concurrency,batch_size,nominal_duration_ms,elapsed_ms,packets_sent,packets_recv_timed,packets_drained,total_recv,bytes_recv,pps,mib_per_sec,cpu_user_pct,cpu_sys_pct,cpu_total_pct,cpu_ns_per_pkt,io_ops_per_pkt,packet_loss_pct,p50_rtt_us,p95_rtt_us,p99_rtt_us,latency_samples,latency_timeouts,latency_invalid,peak_rss_kb\n"
+            "trial_index,mode,packet_size,concurrency,batch_size,nominal_duration_ms,steady_duration_ms,elapsed_ms,sender_shutdown_duration_ms,receiver_completion_duration_ms,packets_sent,packets_recv_steady,packets_recv_completion,packets_recv_timed,packets_drained,total_recv,bytes_recv,pps,completion_pps,mib_per_sec,cpu_user_pct,cpu_sys_pct,cpu_total_pct,cpu_ns_per_pkt,io_ops_per_pkt,packet_loss_pct,p50_rtt_us,p95_rtt_us,p99_rtt_us,latency_samples,latency_timeouts,latency_invalid,peak_rss_kb\n"
         }
 
         pub fn to_csv_row(&self) -> String {
@@ -249,20 +279,26 @@ mod linux {
                 Mode::Batched(b) => format!("batched_{b}"),
             };
             format!(
-                "{},{},{},{},{},{:.3},{:.3},{},{},{},{},{},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{},{},{},{},{},{},{}\n",
+                "{},{},{},{},{},{:.3},{:.3},{:.3},{:.3},{:.3},{},{},{},{},{},{},{},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{},{},{},{},{},{},{}\n",
                 self.trial_index,
                 mode_str,
                 self.packet_size,
                 self.concurrency,
                 self.batch_size,
                 self.nominal_duration.as_secs_f64() * 1000.0,
+                self.steady_duration.as_secs_f64() * 1000.0,
                 self.elapsed.as_secs_f64() * 1000.0,
+                self.sender_shutdown_duration.as_secs_f64() * 1000.0,
+                self.receiver_completion_duration.as_secs_f64() * 1000.0,
                 self.packets_sent,
+                self.packets_recv_steady,
+                self.packets_recv_completion,
                 self.packets_recv_timed,
                 self.packets_drained,
                 self.total_recv,
                 self.bytes_recv,
                 self.pps,
+                self.completion_pps,
                 self.mib_per_sec,
                 self.user_cpu_pct,
                 self.sys_cpu_pct,
@@ -287,20 +323,26 @@ mod linux {
                 Mode::Batched(b) => &format!("batched_{b}"),
             };
             format!(
-                "{{\"trial_index\":{},\"mode\":\"{}\",\"packet_size\":{},\"concurrency\":{},\"batch_size\":{},\"nominal_duration_ms\":{:.3},\"elapsed_ms\":{:.3},\"packets_sent\":{},\"packets_recv_timed\":{},\"packets_drained\":{},\"total_recv\":{},\"bytes_recv\":{},\"pps\":{:.2},\"mib_per_sec\":{:.2},\"cpu_user_pct\":{:.2},\"cpu_sys_pct\":{:.2},\"cpu_total_pct\":{:.2},\"cpu_ns_per_pkt\":{:.2},\"io_ops_per_pkt\":{:.2},\"packet_loss_pct\":{:.2},\"p50_rtt_us\":{},\"p95_rtt_us\":{},\"p99_rtt_us\":{},\"latency_samples\":{},\"latency_timeouts\":{},\"latency_invalid\":{},\"peak_rss_kb\":{}}}",
+                "{{\"trial_index\":{},\"mode\":\"{}\",\"packet_size\":{},\"concurrency\":{},\"batch_size\":{},\"nominal_duration_ms\":{:.3},\"steady_duration_ms\":{:.3},\"elapsed_ms\":{:.3},\"sender_shutdown_duration_ms\":{:.3},\"receiver_completion_duration_ms\":{:.3},\"packets_sent\":{},\"packets_recv_steady\":{},\"packets_recv_completion\":{},\"packets_recv_timed\":{},\"packets_drained\":{},\"total_recv\":{},\"bytes_recv\":{},\"pps\":{:.2},\"completion_pps\":{:.2},\"mib_per_sec\":{:.2},\"cpu_user_pct\":{:.2},\"cpu_sys_pct\":{:.2},\"cpu_total_pct\":{:.2},\"cpu_ns_per_pkt\":{:.2},\"io_ops_per_pkt\":{:.2},\"packet_loss_pct\":{:.2},\"p50_rtt_us\":{},\"p95_rtt_us\":{},\"p99_rtt_us\":{},\"latency_samples\":{},\"latency_timeouts\":{},\"latency_invalid\":{},\"peak_rss_kb\":{}}}",
                 self.trial_index,
                 mode_str,
                 self.packet_size,
                 self.concurrency,
                 self.batch_size,
                 self.nominal_duration.as_secs_f64() * 1000.0,
+                self.steady_duration.as_secs_f64() * 1000.0,
                 self.elapsed.as_secs_f64() * 1000.0,
+                self.sender_shutdown_duration.as_secs_f64() * 1000.0,
+                self.receiver_completion_duration.as_secs_f64() * 1000.0,
                 self.packets_sent,
+                self.packets_recv_steady,
+                self.packets_recv_completion,
                 self.packets_recv_timed,
                 self.packets_drained,
                 self.total_recv,
                 self.bytes_recv,
                 self.pps,
+                self.completion_pps,
                 self.mib_per_sec,
                 self.user_cpu_pct,
                 self.sys_cpu_pct,
@@ -598,6 +640,7 @@ mod linux {
         }
 
         let running = Arc::new(AtomicBool::new(true));
+        let (steady_stop_tx, _) = tokio::sync::watch::channel(false);
         let (shutdown_tx, _) = tokio::sync::watch::channel(false);
         let start_barrier = Arc::new(tokio::sync::Barrier::new(concurrency * 2 + 2));
 
@@ -652,39 +695,56 @@ mod linux {
             while r.try_recv_from(&mut drain_buf).is_ok() {}
         }
 
-        // Spawn receiver tasks with plain local integer counters
+        // Spawn receiver tasks with two-phase accounting (steady state then completion drain)
         let mut recv_handles = Vec::with_capacity(concurrency);
         for r in &receivers {
             let r = r.clone();
+            let mut steady_stop_rx = steady_stop_tx.subscribe();
             let mut shutdown_rx = shutdown_tx.subscribe();
             let barrier = start_barrier.clone();
 
             recv_handles.push(tokio::spawn(async move {
                 barrier.wait().await;
-                let mut local_packets = 0u64;
-                let mut local_io_ops = 0u64;
+                let mut steady_packets = 0u64;
+                let mut steady_io_ops = 0u64;
+                let mut completion_packets = 0u64;
+                let mut completion_io_ops = 0u64;
 
                 match mode {
                     Mode::Baseline => {
                         let mut buf = vec![0u8; packet_size + 64];
+                        // Phase 2: Active steady-state measurement window
+                        loop {
+                            tokio::select! {
+                                biased;
+                                _ = steady_stop_rx.changed() => break,
+                                res = r.recv_from(&mut buf) => {
+                                    res?;
+                                    steady_packets += 1;
+                                    steady_io_ops += 1;
+                                }
+                            }
+                        }
+                        // Phase 3: Completion / in-flight drain until sender shutdown completes
                         loop {
                             tokio::select! {
                                 biased;
                                 _ = shutdown_rx.changed() => break,
                                 res = r.recv_from(&mut buf) => {
                                     res?;
-                                    local_packets += 1;
-                                    local_io_ops += 1;
+                                    completion_packets += 1;
+                                    completion_io_ops += 1;
                                 }
                             }
                         }
                     }
                     Mode::Grouped(batch_size) => {
                         let mut buf = vec![0u8; packet_size + 64];
-                        'outer: loop {
+                        // Phase 2: Active steady-state measurement window
+                        'steady_grouped: loop {
                             tokio::select! {
                                 biased;
-                                _ = shutdown_rx.changed() => break 'outer,
+                                _ = steady_stop_rx.changed() => break 'steady_grouped,
                                 res = r.readable() => {
                                     res?;
                                     let mut count = 0;
@@ -692,8 +752,33 @@ mod linux {
                                         match r.try_recv_from(&mut buf) {
                                             Ok(_) => {
                                                 count += 1;
-                                                local_packets += 1;
-                                                local_io_ops += 1;
+                                                steady_packets += 1;
+                                                steady_io_ops += 1;
+                                            }
+                                            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                                                break;
+                                            }
+                                            Err(e) => return Err(e),
+                                        }
+                                    }
+                                    tokio::task::yield_now().await;
+                                }
+                            }
+                        }
+                        // Phase 3: Completion / in-flight drain until sender shutdown completes
+                        'completion_grouped: loop {
+                            tokio::select! {
+                                biased;
+                                _ = shutdown_rx.changed() => break 'completion_grouped,
+                                res = r.readable() => {
+                                    res?;
+                                    let mut count = 0;
+                                    while count < batch_size {
+                                        match r.try_recv_from(&mut buf) {
+                                            Ok(_) => {
+                                                count += 1;
+                                                completion_packets += 1;
+                                                completion_io_ops += 1;
                                             }
                                             Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
                                                 break;
@@ -712,23 +797,39 @@ mod linux {
                             .iter_mut()
                             .map(|b| InboundDatagram::new(b.as_mut_slice()))
                             .collect();
+                        // Phase 2: Active steady-state measurement window
+                        loop {
+                            tokio::select! {
+                                biased;
+                                _ = steady_stop_rx.changed() => break,
+                                res = r.recv_many(&mut inbound) => {
+                                    let n = res?;
+                                    steady_packets += n as u64;
+                                    steady_io_ops += 1;
+                                    tokio::task::yield_now().await;
+                                }
+                            }
+                        }
+                        // Phase 3: Completion / in-flight drain until sender shutdown completes
                         loop {
                             tokio::select! {
                                 biased;
                                 _ = shutdown_rx.changed() => break,
                                 res = r.recv_many(&mut inbound) => {
                                     let n = res?;
-                                    local_packets += n as u64;
-                                    local_io_ops += 1;
+                                    completion_packets += n as u64;
+                                    completion_io_ops += 1;
                                     tokio::task::yield_now().await;
                                 }
                             }
                         }
                     }
                 }
-                Ok(WorkerStats {
-                    packets: local_packets,
-                    io_ops: local_io_ops,
+                Ok(ReceiverStats {
+                    steady_packets,
+                    steady_io_ops,
+                    completion_packets,
+                    completion_io_ops,
                 })
             }));
         }
@@ -789,7 +890,7 @@ mod linux {
                         }
                     }
                 }
-                Ok(WorkerStats {
+                Ok(SenderStats {
                     packets: local_packets,
                     io_ops: local_io_ops,
                 })
@@ -813,8 +914,8 @@ mod linux {
 
         let probe_interval = config.probe_interval;
         let probe_timeout = config.probe_timeout;
-        let probe_run2 = running.clone();
         let probe_barrier = start_barrier.clone();
+        let mut probe_stop_rx = steady_stop_tx.subscribe();
         let probe_h = tokio::spawn(async move {
             probe_barrier.wait().await;
             let mut samples = Vec::with_capacity(300);
@@ -824,51 +925,63 @@ mod linux {
             let mut ping_payload = [0x5Au8; 64];
             let mut seq = 0u64;
 
-            while probe_run2.load(Ordering::Relaxed) {
-                seq += 1;
-                ping_payload[0..8].copy_from_slice(&seq.to_be_bytes());
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = probe_stop_rx.changed() => break,
+                    ping_res = async {
+                        seq += 1;
+                        ping_payload[0..8].copy_from_slice(&seq.to_be_bytes());
 
-                let t0 = Instant::now();
-                let ping_res = tokio::time::timeout(probe_timeout, async {
-                    probe_client.send_to(&ping_payload, probe_addr).await?;
-                    loop {
-                        let (n, _) = probe_client.recv_from(&mut buf).await?;
-                        if n >= 8 {
-                            let resp_seq = u64::from_be_bytes(buf[0..8].try_into().unwrap());
-                            if resp_seq == seq {
-                                return Ok::<Duration, io::Error>(t0.elapsed());
-                            } else if resp_seq < seq {
-                                // Stale reply from an earlier timed-out request; drop and continue reading
-                                continue;
-                            } else {
-                                // Unexpected future sequence
-                                return Err(io::Error::new(
-                                    io::ErrorKind::InvalidData,
-                                    "invalid probe seq",
-                                ));
+                        let t0 = Instant::now();
+                        let ping_res = tokio::time::timeout(probe_timeout, async {
+                            probe_client.send_to(&ping_payload, probe_addr).await?;
+                            loop {
+                                let (n, _) = probe_client.recv_from(&mut buf).await?;
+                                if n >= 8 {
+                                    let resp_seq = u64::from_be_bytes(buf[0..8].try_into().unwrap());
+                                    if resp_seq == seq {
+                                        return Ok::<Duration, io::Error>(t0.elapsed());
+                                    } else if resp_seq < seq {
+                                        // Stale reply from an earlier timed-out request; drop and continue reading
+                                        continue;
+                                    } else {
+                                        // Unexpected future sequence
+                                        return Err(io::Error::new(
+                                            io::ErrorKind::InvalidData,
+                                            "invalid probe seq",
+                                        ));
+                                    }
+                                } else {
+                                    return Err(io::Error::new(
+                                        io::ErrorKind::InvalidData,
+                                        "truncated probe reply",
+                                    ));
+                                }
                             }
-                        } else {
-                            return Err(io::Error::new(
-                                io::ErrorKind::InvalidData,
-                                "truncated probe reply",
-                            ));
+                        })
+                        .await;
+                        (ping_res, t0)
+                    } => {
+                        let (ping_res, _) = ping_res;
+                        match ping_res {
+                            Ok(Ok(rtt)) => {
+                                samples.push(rtt.as_secs_f64() * 1_000_000.0);
+                            }
+                            Ok(Err(_)) => {
+                                invalid_replies += 1;
+                            }
+                            Err(_) => {
+                                timeouts += 1;
+                            }
+                        }
+                        tokio::select! {
+                            biased;
+                            _ = probe_stop_rx.changed() => break,
+                            _ = tokio::time::sleep(probe_interval) => {}
                         }
                     }
-                })
-                .await;
-
-                match ping_res {
-                    Ok(Ok(rtt)) => {
-                        samples.push(rtt.as_secs_f64() * 1_000_000.0);
-                    }
-                    Ok(Err(_)) => {
-                        invalid_replies += 1;
-                    }
-                    Err(_) => {
-                        timeouts += 1;
-                    }
                 }
-                tokio::time::sleep(probe_interval).await;
             }
             (samples, timeouts, invalid_replies)
         });
@@ -881,12 +994,16 @@ mod linux {
         start_barrier.wait().await;
 
         // Run measurement for the configured nominal duration
-        tokio::time::sleep(config.duration).await;
+        let nominal_duration = config.duration;
+        tokio::time::sleep(nominal_duration).await;
         let nominal_stop_time = Instant::now();
-        let nominal_duration = nominal_stop_time.duration_since(start_time);
+        let rusage_steady = get_rusage()?;
+        let steady_duration = nominal_stop_time.duration_since(start_time);
 
-        // Two-phase coordinated shutdown:
-        // Phase 1: Halt sender generation so no new packets enter the network
+        // Transition from Phase 2 (Steady State) to Phase 3 (Controlled Completion / Drain):
+        // 1. Signal receivers to freeze their steady-state counters and transition to completion drain.
+        let _ = steady_stop_tx.send(true);
+        // 2. Halt sender generation so no new packets enter the network.
         running.store(false, Ordering::Release);
 
         let mut sent = 0u64;
@@ -917,17 +1034,23 @@ mod linux {
                 }
             }
         }
+        let send_stop_time = Instant::now();
+        let sender_shutdown_duration = send_stop_time.duration_since(nominal_stop_time);
 
-        // Phase 2: Halt active receivers and wait for all tasks to terminate
+        // Phase 3 completion: Senders are fully terminated. Signal receivers to exit their completion loop.
         let _ = shutdown_tx.send(true);
 
-        let mut timed_recv = 0u64;
-        let mut recv_io_ops = 0u64;
+        let mut steady_recv = 0u64;
+        let mut steady_recv_io_ops = 0u64;
+        let mut completion_recv = 0u64;
+        let mut _completion_recv_io_ops = 0u64;
         for (i, h) in recv_handles.into_iter().enumerate() {
             match h.await {
                 Ok(Ok(stats)) => {
-                    timed_recv += stats.packets;
-                    recv_io_ops += stats.io_ops;
+                    steady_recv += stats.steady_packets;
+                    steady_recv_io_ops += stats.steady_io_ops;
+                    completion_recv += stats.completion_packets;
+                    _completion_recv_io_ops += stats.completion_io_ops;
                 }
                 Ok(Err(e)) => {
                     if worker_error.is_none() {
@@ -947,7 +1070,10 @@ mod linux {
                 }
             }
         }
+        let recv_stop_time = Instant::now();
+        let receiver_completion_duration = recv_stop_time.duration_since(send_stop_time);
 
+        // Phase 4: Wait for latency probe task to terminate and abort echo server
         let join_timeout = config.probe_timeout + Duration::from_millis(500);
         let (mut latency_samples, latency_timeouts, latency_invalid) =
             match tokio::time::timeout(join_timeout, probe_h).await {
@@ -974,19 +1100,16 @@ mod linux {
         probe_echo_h.abort();
         let _ = probe_echo_h.await;
 
-        // Sample post-measurement timestamp and rusage immediately after all workers finish.
-        // This ensures every sent/received packet and every CPU microsecond are strictly
-        // contained within the [start_time, active_stop_time] window.
-        let active_stop_time = Instant::now();
+        let cleanup_stop_time = Instant::now();
         let rusage_stop = get_rusage()?;
-        let actual_measurement_duration = active_stop_time.duration_since(start_time);
+        let elapsed = cleanup_stop_time.duration_since(start_time);
 
         // Invalidate run if any worker encountered an unexpected failure
         if let Some(err) = worker_error {
             return Err(err);
         }
 
-        // Drain any remaining buffered packets from the kernel queues post-stop
+        // Phase 5: Drain remaining buffered packets from the kernel queues post-stop
         let mut drained_recv = 0u64;
         for r in &receivers {
             let mut drain_buf = [0u8; 2048];
@@ -995,31 +1118,54 @@ mod linux {
             }
         }
 
-        let total_recv = timed_recv + drained_recv;
-        let total_io_ops = send_io_ops + recv_io_ops;
+        let total_recv = steady_recv + completion_recv + drained_recv;
 
-        let utime_diff = timeval_to_duration(rusage_stop.ru_utime)
+        let utime_diff = timeval_to_duration(rusage_steady.ru_utime)
             .saturating_sub(timeval_to_duration(rusage_start.ru_utime));
-        let stime_diff = timeval_to_duration(rusage_stop.ru_stime)
+        let stime_diff = timeval_to_duration(rusage_steady.ru_stime)
             .saturating_sub(timeval_to_duration(rusage_start.ru_stime));
-        let duration_sec = actual_measurement_duration.as_secs_f64();
+        let steady_duration_sec = steady_duration.as_secs_f64();
 
-        let user_cpu_pct = (utime_diff.as_secs_f64() / duration_sec) * 100.0;
-        let sys_cpu_pct = (stime_diff.as_secs_f64() / duration_sec) * 100.0;
-        let total_cpu_pct = user_cpu_pct + sys_cpu_pct;
-
-        let pps = (timed_recv as f64) / duration_sec;
-        let bytes_recv = timed_recv * (packet_size as u64);
-        let mib_per_sec = (bytes_recv as f64) / (1024.0 * 1024.0 * duration_sec);
-
-        let total_cpu_time = utime_diff + stime_diff;
-        let cpu_ns_per_pkt = if timed_recv > 0 {
-            (total_cpu_time.as_nanos() as f64) / (timed_recv as f64)
+        let user_cpu_pct = if steady_duration_sec > 0.0 {
+            (utime_diff.as_secs_f64() / steady_duration_sec) * 100.0
         } else {
             0.0
         };
-        let io_ops_per_pkt = if timed_recv > 0 {
-            (total_io_ops as f64) / (timed_recv as f64)
+        let sys_cpu_pct = if steady_duration_sec > 0.0 {
+            (stime_diff.as_secs_f64() / steady_duration_sec) * 100.0
+        } else {
+            0.0
+        };
+        let total_cpu_pct = user_cpu_pct + sys_cpu_pct;
+
+        let pps = if steady_duration_sec > 0.0 {
+            (steady_recv as f64) / steady_duration_sec
+        } else {
+            0.0
+        };
+        let bytes_recv = steady_recv * (packet_size as u64);
+        let mib_per_sec = if steady_duration_sec > 0.0 {
+            (bytes_recv as f64) / (1024.0 * 1024.0 * steady_duration_sec)
+        } else {
+            0.0
+        };
+
+        let total_cpu_time = utime_diff + stime_diff;
+        let cpu_ns_per_pkt = if steady_recv > 0 {
+            (total_cpu_time.as_nanos() as f64) / (steady_recv as f64)
+        } else {
+            0.0
+        };
+
+        let io_ops_per_pkt = if steady_recv > 0 {
+            ((send_io_ops + steady_recv_io_ops) as f64) / (steady_recv as f64)
+        } else {
+            0.0
+        };
+
+        let completion_duration_sec = receiver_completion_duration.as_secs_f64();
+        let completion_pps = if completion_duration_sec > 0.0 {
+            (completion_recv as f64) / completion_duration_sec
         } else {
             0.0
         };
@@ -1050,15 +1196,21 @@ mod linux {
             concurrency,
             batch_size,
             nominal_duration,
-            elapsed: actual_measurement_duration,
+            steady_duration,
+            elapsed,
+            sender_shutdown_duration,
+            receiver_completion_duration,
             packets_sent: sent,
-            packets_recv_timed: timed_recv,
+            packets_recv_steady: steady_recv,
+            packets_recv_completion: completion_recv,
+            packets_recv_timed: steady_recv,
             packets_drained: drained_recv,
             total_recv,
             bytes_recv,
             successful_io_sends: send_io_ops,
-            successful_io_recvs: recv_io_ops,
+            successful_io_recvs: steady_recv_io_ops,
             pps,
+            completion_pps,
             mib_per_sec,
             user_cpu_pct,
             sys_cpu_pct,
@@ -1214,6 +1366,7 @@ mod linux {
         let test_sock = UdpSocket::bind("127.0.0.1:0").await?;
         let (eff_rcv, eff_snd) = configure_socket(&test_sock)?;
         config_tests::run_self_tests();
+        measurement_tests::run_self_tests().await;
         println!(
         "Host: Linux x86_64, local loopback. Effective socket buffers: SO_RCVBUF = {} bytes ({} KB), SO_SNDBUF = {} bytes ({} KB).",
         eff_rcv,
@@ -1446,6 +1599,206 @@ mod linux {
             assert_eq!(p50, Some(51.0));
             assert_eq!(p95, Some(96.0));
             assert_eq!(p99, Some(100.0));
+        }
+    }
+
+    mod measurement_tests {
+        use super::*;
+
+        pub async fn run_self_tests() {
+            test_zero_duration_safe_handling();
+            test_packet_accounting_trinity().await;
+            test_compatible_intervals().await;
+            test_mode_protocol_parity().await;
+            test_shutdown_delay_immunity().await;
+        }
+
+        fn test_zero_duration_safe_handling() {
+            let tr = TrialResult {
+                trial_index: 0,
+                mode: Mode::Baseline,
+                packet_size: 64,
+                concurrency: 1,
+                batch_size: 1,
+                nominal_duration: Duration::ZERO,
+                steady_duration: Duration::ZERO,
+                elapsed: Duration::ZERO,
+                sender_shutdown_duration: Duration::ZERO,
+                receiver_completion_duration: Duration::ZERO,
+                packets_sent: 0,
+                packets_recv_steady: 0,
+                packets_recv_completion: 0,
+                packets_recv_timed: 0,
+                packets_drained: 0,
+                total_recv: 0,
+                bytes_recv: 0,
+                successful_io_sends: 0,
+                successful_io_recvs: 0,
+                pps: 0.0,
+                completion_pps: 0.0,
+                mib_per_sec: 0.0,
+                user_cpu_pct: 0.0,
+                sys_cpu_pct: 0.0,
+                total_cpu_pct: 0.0,
+                cpu_ns_per_pkt: 0.0,
+                io_ops_per_pkt: 0.0,
+                packet_loss_pct: 0.0,
+                p50_rtt_us: None,
+                p95_rtt_us: None,
+                p99_rtt_us: None,
+                latency_samples: 0,
+                latency_timeouts: 0,
+                latency_invalid: 0,
+                peak_rss_kb: 0,
+                vol_cs: 0,
+                invol_cs: 0,
+                effective_rcvbuf: 0,
+                effective_sndbuf: 0,
+            };
+            assert!(!tr.pps.is_nan());
+            assert!(!tr.mib_per_sec.is_nan());
+            assert!(!tr.user_cpu_pct.is_nan());
+            assert!(!tr.sys_cpu_pct.is_nan());
+            assert!(!tr.cpu_ns_per_pkt.is_nan());
+            assert!(!tr.io_ops_per_pkt.is_nan());
+            let summary = BenchSummary::from_trials(vec![tr]);
+            assert_eq!(summary.median_pps, 0.0);
+        }
+
+        async fn test_packet_accounting_trinity() {
+            let config = BenchConfig {
+                duration: Duration::from_millis(50),
+                warmup_duration: Duration::from_millis(10),
+                probe_interval: Duration::from_millis(2),
+                probe_timeout: Duration::from_millis(10),
+                min_latency_samples: 1,
+                trials: 1,
+                seed: 12345,
+                csv_path: None,
+                json_path: None,
+            };
+            let res = run_throughput_bench(Mode::Grouped(8), 64, 2, 0, &config)
+                .await
+                .expect("benchmark trial should succeed");
+
+            assert!(res.packets_sent > 0, "packets should have been sent");
+            assert!(
+                res.packets_recv_steady > 0,
+                "steady packets should be positive"
+            );
+            assert_eq!(
+                res.total_recv,
+                res.packets_recv_steady + res.packets_recv_completion + res.packets_drained,
+                "total_recv must equal steady + completion + drained exactly"
+            );
+            assert_eq!(
+                res.packets_recv_timed, res.packets_recv_steady,
+                "packets_recv_timed must match packets_recv_steady"
+            );
+            assert!(
+                res.packet_loss_pct >= 0.0 && res.packet_loss_pct <= 100.0,
+                "packet loss must be between 0 and 100%"
+            );
+        }
+
+        async fn test_compatible_intervals() {
+            let config = BenchConfig {
+                duration: Duration::from_millis(60),
+                warmup_duration: Duration::from_millis(10),
+                probe_interval: Duration::from_millis(2),
+                probe_timeout: Duration::from_millis(10),
+                min_latency_samples: 1,
+                trials: 1,
+                seed: 54321,
+                csv_path: None,
+                json_path: None,
+            };
+            let res = run_throughput_bench(Mode::Baseline, 64, 1, 0, &config)
+                .await
+                .expect("trial should succeed");
+
+            assert!(
+                res.steady_duration >= Duration::from_millis(50),
+                "steady_duration should reflect nominal run duration"
+            );
+            assert!(
+                res.elapsed >= res.steady_duration,
+                "total elapsed must be >= steady_duration"
+            );
+            assert!(
+                res.user_cpu_pct >= 0.0,
+                "user CPU percentage must be non-negative"
+            );
+            assert!(
+                res.sys_cpu_pct >= 0.0,
+                "system CPU percentage must be non-negative"
+            );
+            assert!(
+                (res.total_cpu_pct - (res.user_cpu_pct + res.sys_cpu_pct)).abs() < 1e-6,
+                "total_cpu_pct must equal user + sys"
+            );
+            let expected_pps = (res.packets_recv_steady as f64) / res.steady_duration.as_secs_f64();
+            assert!(
+                (res.pps - expected_pps).abs() < 1e-6,
+                "pps must be computed using steady_duration, not total elapsed"
+            );
+        }
+
+        async fn test_mode_protocol_parity() {
+            let config = BenchConfig {
+                duration: Duration::from_millis(40),
+                warmup_duration: Duration::from_millis(10),
+                probe_interval: Duration::from_millis(2),
+                probe_timeout: Duration::from_millis(10),
+                min_latency_samples: 1,
+                trials: 1,
+                seed: 99999,
+                csv_path: None,
+                json_path: None,
+            };
+
+            for mode in [Mode::Baseline, Mode::Grouped(4), Mode::Batched(4)] {
+                let res = run_throughput_bench(mode, 64, 1, 0, &config)
+                    .await
+                    .expect("trial should succeed");
+                assert!(res.packets_sent > 0);
+                assert!(res.packets_recv_steady > 0);
+                assert_eq!(
+                    res.total_recv,
+                    res.packets_recv_steady + res.packets_recv_completion + res.packets_drained
+                );
+                assert!(res.pps > 0.0);
+            }
+        }
+
+        async fn test_shutdown_delay_immunity() {
+            let config = BenchConfig {
+                duration: Duration::from_millis(50),
+                warmup_duration: Duration::from_millis(10),
+                probe_interval: Duration::from_millis(2),
+                probe_timeout: Duration::from_millis(10),
+                min_latency_samples: 1,
+                trials: 1,
+                seed: 77777,
+                csv_path: None,
+                json_path: None,
+            };
+            let res = run_throughput_bench(Mode::Batched(8), 64, 2, 0, &config)
+                .await
+                .expect("trial should succeed");
+
+            let steady_sec = res.steady_duration.as_secs_f64();
+            let elapsed_sec = res.elapsed.as_secs_f64();
+            let true_steady_pps = (res.packets_recv_steady as f64) / steady_sec;
+            let diluted_pps = (res.packets_recv_steady as f64) / elapsed_sec;
+
+            assert_eq!(res.pps, true_steady_pps);
+            if res.elapsed > res.steady_duration {
+                assert!(
+                    res.pps >= diluted_pps,
+                    "steady-state PPS must not be diluted by shutdown/join duration"
+                );
+            }
         }
     }
 }
