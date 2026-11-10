@@ -377,6 +377,10 @@ mod linux {
         pub mean_mib_per_sec: f64,
         pub median_cpu_pct: f64,
         pub mean_cpu_pct: f64,
+        pub median_user_cpu_pct: f64,
+        pub mean_user_cpu_pct: f64,
+        pub median_sys_cpu_pct: f64,
+        pub mean_sys_cpu_pct: f64,
         pub median_cpu_ns_per_pkt: f64,
         pub mean_cpu_ns_per_pkt: f64,
         pub median_io_ops_per_pkt: f64,
@@ -427,10 +431,18 @@ mod linux {
             let median_mib_per_sec = sorted_mib[n / 2];
             let mean_mib_per_sec = trials.iter().map(|t| t.mib_per_sec).sum::<f64>() / (n as f64);
 
-            let mut sorted_cpu: Vec<f64> = trials.iter().map(|t| t.total_cpu_pct).collect();
-            sorted_cpu.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-            let median_cpu_pct = sorted_cpu[n / 2];
-            let mean_cpu_pct = trials.iter().map(|t| t.total_cpu_pct).sum::<f64>() / (n as f64);
+            let mut sorted_user_cpu: Vec<f64> = trials.iter().map(|t| t.user_cpu_pct).collect();
+            sorted_user_cpu.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            let median_user_cpu_pct = sorted_user_cpu[n / 2];
+            let mean_user_cpu_pct = trials.iter().map(|t| t.user_cpu_pct).sum::<f64>() / (n as f64);
+
+            let mut sorted_sys_cpu: Vec<f64> = trials.iter().map(|t| t.sys_cpu_pct).collect();
+            sorted_sys_cpu.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            let median_sys_cpu_pct = sorted_sys_cpu[n / 2];
+            let mean_sys_cpu_pct = trials.iter().map(|t| t.sys_cpu_pct).sum::<f64>() / (n as f64);
+
+            let median_cpu_pct = median_user_cpu_pct + median_sys_cpu_pct;
+            let mean_cpu_pct = mean_user_cpu_pct + mean_sys_cpu_pct;
 
             let mut sorted_cpu_ns: Vec<f64> = trials.iter().map(|t| t.cpu_ns_per_pkt).collect();
             sorted_cpu_ns.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
@@ -479,6 +491,10 @@ mod linux {
                 mean_mib_per_sec,
                 median_cpu_pct,
                 mean_cpu_pct,
+                median_user_cpu_pct,
+                mean_user_cpu_pct,
+                median_sys_cpu_pct,
+                mean_sys_cpu_pct,
                 median_cpu_ns_per_pkt,
                 mean_cpu_ns_per_pkt,
                 median_io_ops_per_pkt,
@@ -501,7 +517,7 @@ mod linux {
             };
             let trials_json: Vec<String> = self.raw_trials.iter().map(|t| t.to_json()).collect();
             format!(
-                "{{\"mode\":\"{}\",\"packet_size\":{},\"concurrency\":{},\"trials\":{},\"median_pps\":{:.2},\"mean_pps\":{:.2},\"stddev_pps\":{:.2},\"min_pps\":{:.2},\"max_pps\":{:.2},\"median_mib_per_sec\":{:.2},\"median_cpu_pct\":{:.2},\"median_cpu_ns_per_pkt\":{:.2},\"median_io_ops_per_pkt\":{:.2},\"median_loss_pct\":{:.2},\"median_p50_rtt_us\":{},\"median_p95_rtt_us\":{},\"median_p99_rtt_us\":{},\"raw_trials\":[\n    {}\n  ]}}",
+                "{{\"mode\":\"{}\",\"packet_size\":{},\"concurrency\":{},\"trials\":{},\"median_pps\":{:.2},\"mean_pps\":{:.2},\"stddev_pps\":{:.2},\"min_pps\":{:.2},\"max_pps\":{:.2},\"median_mib_per_sec\":{:.2},\"median_cpu_pct\":{:.2},\"median_user_cpu_pct\":{:.2},\"median_sys_cpu_pct\":{:.2},\"median_cpu_ns_per_pkt\":{:.2},\"median_io_ops_per_pkt\":{:.2},\"median_loss_pct\":{:.2},\"median_p50_rtt_us\":{},\"median_p95_rtt_us\":{},\"median_p99_rtt_us\":{},\"raw_trials\":[\n    {}\n  ]}}",
                 mode_str,
                 self.packet_size,
                 self.concurrency,
@@ -513,6 +529,8 @@ mod linux {
                 self.max_pps,
                 self.median_mib_per_sec,
                 self.median_cpu_pct,
+                self.median_user_cpu_pct,
+                self.median_sys_cpu_pct,
                 self.median_cpu_ns_per_pkt,
                 self.median_io_ops_per_pkt,
                 self.median_loss_pct,
@@ -1340,8 +1358,8 @@ mod linux {
             s.median_pps,
             s.median_mib_per_sec,
             s.median_cpu_pct,
-            r.user_cpu_pct,
-            r.sys_cpu_pct,
+            s.median_user_cpu_pct,
+            s.median_sys_cpu_pct,
             s.median_cpu_ns_per_pkt,
             s.median_io_ops_per_pkt,
             s.median_loss_pct,
@@ -1611,6 +1629,7 @@ mod linux {
             test_compatible_intervals().await;
             test_mode_protocol_parity().await;
             test_shutdown_delay_immunity().await;
+            test_cpu_reporting_consistency();
         }
 
         fn test_zero_duration_safe_handling() {
@@ -1799,6 +1818,82 @@ mod linux {
                     "steady-state PPS must not be diluted by shutdown/join duration"
                 );
             }
+        }
+
+        fn test_cpu_reporting_consistency() {
+            let make_trial = |idx: usize, pps: f64, user: f64, sys: f64| TrialResult {
+                trial_index: idx,
+                mode: Mode::Baseline,
+                packet_size: 64,
+                concurrency: 1,
+                batch_size: 1,
+                nominal_duration: Duration::from_millis(100),
+                steady_duration: Duration::from_millis(100),
+                elapsed: Duration::from_millis(105),
+                sender_shutdown_duration: Duration::from_millis(2),
+                receiver_completion_duration: Duration::from_millis(3),
+                packets_sent: 1000,
+                packets_recv_steady: 1000,
+                packets_recv_completion: 0,
+                packets_recv_timed: 1000,
+                packets_drained: 0,
+                total_recv: 1000,
+                bytes_recv: 64000,
+                successful_io_sends: 1000,
+                successful_io_recvs: 1000,
+                pps,
+                completion_pps: 0.0,
+                mib_per_sec: 0.61,
+                user_cpu_pct: user,
+                sys_cpu_pct: sys,
+                total_cpu_pct: user + sys,
+                cpu_ns_per_pkt: 5000.0,
+                io_ops_per_pkt: 2.0,
+                packet_loss_pct: 0.0,
+                p50_rtt_us: None,
+                p95_rtt_us: None,
+                p99_rtt_us: None,
+                latency_samples: 0,
+                latency_timeouts: 0,
+                latency_invalid: 0,
+                peak_rss_kb: 50000,
+                vol_cs: 10,
+                invol_cs: 5,
+                effective_rcvbuf: 4096,
+                effective_sndbuf: 4096,
+            };
+
+            // Case 1: Single trial
+            let t1 = make_trial(0, 10000.0, 35.0, 105.0);
+            let s1 = BenchSummary::from_trials(vec![t1]);
+            assert_eq!(s1.median_user_cpu_pct, 35.0);
+            assert_eq!(s1.median_sys_cpu_pct, 105.0);
+            assert_eq!(s1.median_cpu_pct, 140.0);
+            assert!(
+                (s1.median_cpu_pct - (s1.median_user_cpu_pct + s1.median_sys_cpu_pct)).abs() < 1e-9
+            );
+
+            // Case 2: Multi-trial with varying user and system percentages
+            let trials = vec![
+                make_trial(0, 9000.0, 30.0, 110.0),
+                make_trial(1, 10000.0, 45.0, 95.0),
+                make_trial(2, 11000.0, 40.0, 120.0),
+            ];
+            let s_multi = BenchSummary::from_trials(trials);
+            assert_eq!(s_multi.median_user_cpu_pct, 40.0);
+            assert_eq!(s_multi.median_sys_cpu_pct, 110.0);
+            assert_eq!(s_multi.median_cpu_pct, 150.0);
+            assert!(
+                (s_multi.median_cpu_pct
+                    - (s_multi.median_user_cpu_pct + s_multi.median_sys_cpu_pct))
+                    .abs()
+                    < 1e-9
+            );
+            assert!(
+                (s_multi.mean_cpu_pct - (s_multi.mean_user_cpu_pct + s_multi.mean_sys_cpu_pct))
+                    .abs()
+                    < 1e-9
+            );
         }
     }
 }
