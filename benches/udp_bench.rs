@@ -1596,82 +1596,115 @@ mod linux {
         let batch_sizes = [4, 8, 16, 32, 64];
         let mut all_results = Vec::new();
 
-        // Section 1: Baseline Tokio across all Packet Sizes and Concurrencies
-        println!(
-            "### PART 1: Baseline Tokio UDP Operations (Single-Packet async send_to/recv_from)"
-        );
-        print_header();
-        let mut s1_cases = Vec::new();
-        for &pkt in &packet_sizes {
-            for &conc in &concurrencies {
-                s1_cases.push((Mode::Baseline, pkt, conc));
+        let run_revalidate_only = args.iter().any(|a| a == "--revalidate")
+            || std::env::var("UDP_BENCH_REVALIDATE")
+                .map(|v| v == "1")
+                .unwrap_or(false);
+
+        if run_revalidate_only {
+            println!("### PERFORMANCE REVALIDATION MATRIX (Phase 6 Focused Audit)");
+            print_header();
+            let revalidate_cases = vec![
+                (Mode::Baseline, 64, 1),
+                (Mode::Grouped(32), 64, 1),
+                (Mode::Batched(32), 64, 1),
+                (Mode::Baseline, 64, 16),
+                (Mode::Grouped(32), 64, 16),
+                (Mode::Batched(32), 64, 16),
+                (Mode::Batched(64), 64, 16),
+                (Mode::Baseline, 1472, 1),
+                (Mode::Grouped(32), 1472, 1),
+                (Mode::Batched(32), 1472, 1),
+                (Mode::Baseline, 1472, 16),
+                (Mode::Grouped(32), 1472, 16),
+                (Mode::Batched(32), 1472, 16),
+                (Mode::Batched(64), 1472, 16),
+                (Mode::Baseline, 1472, 64),
+                (Mode::Grouped(32), 1472, 64),
+                (Mode::Batched(32), 1472, 64),
+            ];
+            for s in run_cases(&revalidate_cases, &config).await? {
+                print_result(&s);
+                all_results.push(s);
             }
-        }
-        for s in run_cases(&s1_cases, &config).await? {
-            print_result(&s);
-            all_results.push(s);
-        }
-        println!();
+        } else {
+            // Section 1: Baseline Tokio across all Packet Sizes and Concurrencies
+            println!(
+                "### PART 1: Baseline Tokio UDP Operations (Single-Packet async send_to/recv_from)"
+            );
+            print_header();
+            let mut s1_cases = Vec::new();
+            for &pkt in &packet_sizes {
+                for &conc in &concurrencies {
+                    s1_cases.push((Mode::Baseline, pkt, conc));
+                }
+            }
+            for s in run_cases(&s1_cases, &config).await? {
+                print_result(&s);
+                all_results.push(s);
+            }
+            println!();
 
-        // Section 2: Three-Way Comparison: Baseline vs Grouped vs Batched (64B packets, 16x16 concurrency)
-        println!("### PART 2: Three-Way Comparison (Packet Size: 64B, Concurrency: 16x16)");
-        print_header();
-        let mut s2_cases = vec![(Mode::Baseline, 64, 16)];
-        for &bs in &batch_sizes {
-            s2_cases.push((Mode::Grouped(bs), 64, 16));
-            s2_cases.push((Mode::Batched(bs), 64, 16));
-        }
-        for s in run_cases(&s2_cases, &config).await? {
-            print_result(&s);
-            all_results.push(s);
-        }
-        println!();
+            // Section 2: Three-Way Comparison: Baseline vs Grouped vs Batched (64B packets, 16x16 concurrency)
+            println!("### PART 2: Three-Way Comparison (Packet Size: 64B, Concurrency: 16x16)");
+            print_header();
+            let mut s2_cases = vec![(Mode::Baseline, 64, 16)];
+            for &bs in &batch_sizes {
+                s2_cases.push((Mode::Grouped(bs), 64, 16));
+                s2_cases.push((Mode::Batched(bs), 64, 16));
+            }
+            for s in run_cases(&s2_cases, &config).await? {
+                print_result(&s);
+                all_results.push(s);
+            }
+            println!();
 
-        // Section 3: Three-Way Comparison: Baseline vs Grouped vs Batched (1472B packets, 16x16 concurrency)
-        println!("### PART 3: Three-Way Comparison (Packet Size: 1472B, Concurrency: 16x16)");
-        print_header();
-        let mut s3_cases = vec![(Mode::Baseline, 1472, 16)];
-        for &bs in &batch_sizes {
-            s3_cases.push((Mode::Grouped(bs), 1472, 16));
-            s3_cases.push((Mode::Batched(bs), 1472, 16));
-        }
-        for s in run_cases(&s3_cases, &config).await? {
-            print_result(&s);
-            all_results.push(s);
-        }
-        println!();
+            // Section 3: Three-Way Comparison: Baseline vs Grouped vs Batched (1472B packets, 16x16 concurrency)
+            println!("### PART 3: Three-Way Comparison (Packet Size: 1472B, Concurrency: 16x16)");
+            print_header();
+            let mut s3_cases = vec![(Mode::Baseline, 1472, 16)];
+            for &bs in &batch_sizes {
+                s3_cases.push((Mode::Grouped(bs), 1472, 16));
+                s3_cases.push((Mode::Batched(bs), 1472, 16));
+            }
+            for s in run_cases(&s3_cases, &config).await? {
+                print_result(&s);
+                all_results.push(s);
+            }
+            println!();
 
-        // Section 4: Concurrency Scaling (Packet Size: 64B): Baseline vs Group-32 vs Batch-32
-        println!(
-            "### PART 4: Concurrency Scaling (Packet Size: 64B: Baseline vs Group-32 vs Batch-32)"
-        );
-        print_header();
-        let mut s4_cases = Vec::new();
-        for &conc in &concurrencies {
-            s4_cases.push((Mode::Baseline, 64, conc));
-            s4_cases.push((Mode::Grouped(32), 64, conc));
-            s4_cases.push((Mode::Batched(32), 64, conc));
-        }
-        for s in run_cases(&s4_cases, &config).await? {
-            print_result(&s);
-            all_results.push(s);
-        }
-        println!();
+            // Section 4: Concurrency Scaling (Packet Size: 64B): Baseline vs Group-32 vs Batch-32
+            println!(
+                "### PART 4: Concurrency Scaling (Packet Size: 64B: Baseline vs Group-32 vs Batch-32)"
+            );
+            print_header();
+            let mut s4_cases = Vec::new();
+            for &conc in &concurrencies {
+                s4_cases.push((Mode::Baseline, 64, conc));
+                s4_cases.push((Mode::Grouped(32), 64, conc));
+                s4_cases.push((Mode::Batched(32), 64, conc));
+            }
+            for s in run_cases(&s4_cases, &config).await? {
+                print_result(&s);
+                all_results.push(s);
+            }
+            println!();
 
-        // Section 5: Concurrency Scaling (Packet Size: 1472B): Baseline vs Group-32 vs Batch-32
-        println!(
-            "### PART 5: Concurrency Scaling (Packet Size: 1472B: Baseline vs Group-32 vs Batch-32)"
-        );
-        print_header();
-        let mut s5_cases = Vec::new();
-        for &conc in &concurrencies {
-            s5_cases.push((Mode::Baseline, 1472, conc));
-            s5_cases.push((Mode::Grouped(32), 1472, conc));
-            s5_cases.push((Mode::Batched(32), 1472, conc));
-        }
-        for s in run_cases(&s5_cases, &config).await? {
-            print_result(&s);
-            all_results.push(s);
+            // Section 5: Concurrency Scaling (Packet Size: 1472B): Baseline vs Group-32 vs Batch-32
+            println!(
+                "### PART 5: Concurrency Scaling (Packet Size: 1472B: Baseline vs Group-32 vs Batch-32)"
+            );
+            print_header();
+            let mut s5_cases = Vec::new();
+            for &conc in &concurrencies {
+                s5_cases.push((Mode::Baseline, 1472, conc));
+                s5_cases.push((Mode::Grouped(32), 1472, conc));
+                s5_cases.push((Mode::Batched(32), 1472, conc));
+            }
+            for s in run_cases(&s5_cases, &config).await? {
+                print_result(&s);
+                all_results.push(s);
+            }
         }
         println!();
 
