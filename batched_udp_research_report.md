@@ -23,32 +23,32 @@ All sockets used 2 MB socket buffers (Linux allocates 4,096 KB effective `SO_RCV
 ===================================================================================================
 Mode             Batch Size   Throughput (pps)   IO-Ops/Pkt   CPU-ns/Pkt   User CPU%   Loaded p50 RTT
 ---------------------------------------------------------------------------------------------------
-Baseline             1             789,366          2.00        7,245 ns     73.6%        486.7 µs
-Grouped             32             803,531          2.01        7,072 ns     67.0%        151.5 µs
-Batched (Native)    32             914,498          0.08        5,696 ns     14.3%        161.0 µs
-Batched (Native)    64             941,680          0.04        5,574 ns      7.5%        191.8 µs
+Baseline             1           1,048,450          2.00        7,006 ns    128.9%        266.4 µs
+Grouped             32           1,102,041          2.00        6,492 ns     90.4%        141.5 µs
+Batched (Native)    32           1,261,139          0.09        5,232 ns     19.2%        134.8 µs
+Batched (Native)    64           1,356,788          0.05        5,025 ns     13.2%        186.7 µs
 ===================================================================================================
 ```
 
-1. **User CPU drops by 80% to 90%**:
-   - In baseline mode, user-space CPU sits at **73.6%** (out of 571.9% total process CPU across cores).
-   - In native batched mode (`Batch-32`), user CPU drops to **14.3%** (an **80.6% reduction**). At `Batch-64`, it drops to **7.5%** (an **89.8% reduction**).
-   - Tokio saves this CPU because it no longer wakes, polls, and reschedules a future for every single packet. Total process CPU drops from 571.9% to 525.3% while delivering **15.9% higher throughput**.
+1. **User CPU drops by 85%**:
+   - In baseline mode, user-space CPU sits at **128.9%** (out of 736.9% total process CPU across cores).
+   - In native batched mode (`Batch-32`), user CPU drops to **19.2%** (an **85.1% reduction**). At `Batch-64`, it drops to **13.2%** (an **89.8% reduction**).
+   - Tokio saves this CPU because it no longer wakes, polls, and reschedules a future for every single packet. Total process CPU drops from 736.9% to 662.0% while delivering **20.3% higher throughput**.
 
-2. **Kernel transitions drop by 25× to 50×**:
-   - Baseline and grouped modes need **~2.0 socket calls per delivered packet** (one send, one recv).
-   - Batch-32 drops this to **0.08 socket calls/packet** (a 25× reduction), and Batch-64 drops it to **0.04 calls/packet** (a 50× reduction).
+2. **Kernel transitions drop by 22× to 40×**:
+   - Baseline and grouped modes need **2.0 socket calls per delivered packet** (one send, one recv).
+   - Batch-32 drops this to **0.09 socket calls/packet** (a 22× reduction), and Batch-64 drops it to **0.05 calls/packet** (a 40× reduction).
 
 3. **Throughput**:
-   - **64B packets**: Baseline delivers **789k pps** (48.2 MiB/s). Batch-32 delivers **914k pps** (55.8 MiB/s, +15.9%). Batch-64 reaches **941k pps** (57.5 MiB/s, +19.3%). Grouped-32 delivers **803k pps**, showing that true kernel batching yields an extra ~14% throughput over user-space grouping alone.
-   - **1472B packets**: Baseline reaches **804k pps** (1,129 MiB/s). Batch-32 delivers **922k pps** (**1,295 MiB/s ≈ 1.26 GiB/s**, +14.7%). At 64x64 concurrency, Batch-32 reaches **953k pps** (**1,339 MiB/s ≈ 1.31 GiB/s**, or ~11 Gbps wire rate), a **39.4% gain** over baseline's 684k pps.
+   - **64B packets**: Baseline delivers **1,048k pps** (64.0 MiB/s). Batch-32 delivers **1,261k pps** (77.0 MiB/s, +20.3%). Batch-64 reaches **1,357k pps** (82.8 MiB/s, +29.4%). Grouped-32 delivers **1,102k pps**, showing that true kernel batching yields an extra 15% throughput over user-space grouping alone.
+   - **1472B packets**: Baseline reaches **963k pps** (1,352 MiB/s). Batch-32 delivers **1,227k pps** (**1,722 MiB/s ≈ 1.68 GiB/s**, +27.4%). At 64x64 concurrency, Batch-32 reaches **1,148k pps** (**1,611 MiB/s ≈ 1.57 GiB/s**, or ~13.5 Gbps wire rate), a **25.5% gain** over baseline's 914k pps.
 
 4. **Latency under saturation**:
-   - When heavily loaded (64x64 tasks, 1472B packets), baseline queues up datagrams, pushing median latency to **2.9 ms** (p95 6.3 ms).
-   - Batch-32 drains socket queues much faster, keeping median latency at **490 µs** (p95 1.0 ms) — a **5.9× reduction in loaded latency**.
+   - When heavily loaded (64x64 tasks, 1472B packets), baseline queues up datagrams, pushing median latency to **1,665 µs** (p99 7,044 µs) with 0.66% packet loss.
+   - Batch-32 drains socket queues efficiently with zero packet loss, keeping median latency at **466 µs** (p99 1,320 µs) — a **3.6× reduction in loaded median latency** and a **5.3× reduction in loaded tail latency**.
 
 5. **Single-socket ping-pong overhead**:
-   - With a single sender and receiver (concurrency = 1, no queuing), batching adds setup overhead: 12.2 µs/pkt vs 9.3 µs/pkt for baseline. Batching only provides value when there is queued traffic to batch.
+   - With a single sender and receiver (concurrency = 1, no queuing), batching adds minor setup overhead: CPU cost is 10.7 µs/pkt vs 8.9 µs/pkt for baseline, though batching still delivers 191k pps (+20.0%) due to syscall reduction. Batching provides its greatest value when there is queued traffic to batch.
 
 ---
 
